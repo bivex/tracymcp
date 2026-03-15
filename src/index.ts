@@ -17,6 +17,7 @@ import { TracyFrameParser } from "./frames.js";
 import { TracyPlotParser } from "./plots.js";
 import { TracyLockParser } from "./locks.js";
 import { TracyGpuParser } from "./gpu.js";
+import { buildFlameGraph, formatFlameGraph, formatFoldedStacks } from "./flamegraph.js";
 
 const CSVEXPORT_BINARY = path.join(
   path.dirname(new URL(import.meta.url).pathname),
@@ -214,6 +215,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             path: { type: "string", description: "Path to the .tracy file" },
             max_avg_time_ms: { type: "number", description: "Flag GPU zones averaging above this (default: 5)" },
             max_total_time_ms: { type: "number", description: "Flag GPU zones with total time above this (default: 50)" },
+          },
+          required: ["path"],
+        },
+      },
+      {
+        name: "get_flame_graph",
+        description: "Build a flame graph from Tracy zone data showing the call tree with inclusive/exclusive time. Reconstructs parent→child relationships from per-call timing. Outputs a text tree (default) or folded stacks for flamegraph.pl / speedscope.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Path to the .tracy file" },
+            format: { type: "string", enum: ["tree", "folded"], description: "Output format: 'tree' (default) for indented text, 'folded' for folded-stacks (flamegraph.pl compatible)" },
+            min_percent: { type: "number", description: "Hide nodes below this % of total time (default: 1.0)" },
+            max_depth: { type: "number", description: "Maximum tree depth to show (default: 8)" },
           },
           required: ["path"],
         },
@@ -712,6 +727,54 @@ ${percentileLines}`;
         return { content: [{ type: "text", text: parser.format(zones, max_avg_time_ms ?? 5, max_total_time_ms ?? 50) }] };
       } catch (error) {
         return { content: [{ type: "text", text: `Error parsing GPU zones: ${error}` }], isError: true };
+      }
+    }
+
+    case "get_flame_graph": {
+      const { path, format, min_percent, max_depth } = args as {
+        path: string;
+        format?: "tree" | "folded";
+        min_percent?: number;
+        max_depth?: number;
+      };
+
+      if (!fs.existsSync(path)) {
+        return { content: [{ type: "text", text: `Error: File not found: ${path}` }], isError: true };
+      }
+
+      try {
+        // Use tracy-csvexport -u (per-call) to get timing data for all zones
+        if (!fs.existsSync(CSVEXPORT_BINARY)) {
+          return {
+            content: [{ type: "text", text: `tracy-csvexport not found at ${CSVEXPORT_BINARY}` }],
+            isError: true,
+          };
+        }
+
+        const result = spawnSync(CSVEXPORT_BINARY, ["-u", path], {
+          encoding: "utf8",
+          maxBuffer: 256 * 1024 * 1024,
+        });
+
+        if (result.status !== 0 || !result.stdout) {
+          return {
+            content: [{ type: "text", text: `tracy-csvexport failed: ${result.stderr || "unknown error"}` }],
+            isError: true,
+          };
+        }
+
+        const fg = buildFlameGraph(result.stdout);
+
+        const text = format === "folded"
+          ? formatFoldedStacks(fg)
+          : formatFlameGraph(fg, {
+              minPercent: min_percent ?? 1.0,
+              maxDepth:   max_depth ?? 8,
+            });
+
+        return { content: [{ type: "text", text }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error building flame graph: ${error}` }], isError: true };
       }
     }
 
