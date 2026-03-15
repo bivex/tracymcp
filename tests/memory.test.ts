@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { TracyMemoryParser, MemoryStats, MemoryIssue } from '../src/memory.js';
+import { TracyMemoryParser, MemoryStats, MemoryIssue, CallstackFrame } from '../src/memory.js';
 import { TracyReader } from '../src/reader.js';
 import * as path from 'node:path';
 
@@ -263,6 +263,45 @@ describe('TracyMemoryParser', () => {
 
       // Should not crash, just skip unknown events
       expect(stats).toBeDefined();
+    });
+  });
+
+  describe('Callstack Support', () => {
+    it('should attach callstack to leaks from leaky_engine.tracy', async () => {
+      const leakyPath = path.join(__dirname, '../demo/leaky_engine.tracy');
+      const reader2 = new TracyReader(leakyPath);
+      const data2 = await reader2.readAllData();
+      reader2.close();
+
+      const parser = new TracyMemoryParser();
+      const stats = parser.parseMemoryEvents(data2);
+
+      // At least one leak should have a callstack
+      const leaksWithCallstack = stats.leaks.filter(l => l.callstack && l.callstack.length > 0);
+      expect(leaksWithCallstack.length).toBeGreaterThan(0);
+
+      // TextureCache leaks should show the callstack
+      const texLeak = leaksWithCallstack.find(l => l.name?.includes('TextureCache'));
+      expect(texLeak).toBeDefined();
+      expect(texLeak!.callstack![0].fn).toBe('Texture::AllocPixelData');
+      expect(texLeak!.callstack![0].file).toBe('texture.cpp');
+      expect(texLeak!.callstack![0].line).toBe(42);
+    });
+
+    it('should render callstack in formatMemoryIssues output', async () => {
+      const leakyPath = path.join(__dirname, '../demo/leaky_engine.tracy');
+      const reader2 = new TracyReader(leakyPath);
+      const data2 = await reader2.readAllData();
+      reader2.close();
+
+      const parser = new TracyMemoryParser();
+      const stats = parser.parseMemoryEvents(data2);
+      const issues = parser.findMemoryIssues(stats, { maxLeakSize: 1024 });
+      const output = parser.formatMemoryIssues(issues);
+
+      expect(output).toContain('Callstack:');
+      expect(output).toContain('Texture::AllocPixelData');
+      expect(output).toContain('texture.cpp:42');
     });
   });
 });

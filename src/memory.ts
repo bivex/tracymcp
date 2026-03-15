@@ -20,6 +20,13 @@ const enum MemEventType {
   SingleStringData = 99,
   SecondStringData = 100,
   StringData = 104,
+  MemCallstack = 200,   // custom: ptr(8)+frameCount(1)+[funcPtr(8)+filePtr(8)+line(4)]×N
+}
+
+export interface CallstackFrame {
+  fn: string;
+  file: string;
+  line: number;
 }
 
 export interface MemoryAllocation {
@@ -31,6 +38,7 @@ export interface MemoryAllocation {
   name?: string;
   thread: number;
   leaked?: boolean;
+  callstack?: CallstackFrame[];
 }
 
 export interface MemoryStats {
@@ -52,6 +60,7 @@ export interface MemoryIssue {
   count?: number;
   description: string;
   recommendation: string;
+  callstack?: CallstackFrame[];
 }
 
 export interface MemoryAnalysisOptions {
@@ -78,6 +87,7 @@ export class TracyMemoryParser {
   private freeCount: number = 0;
   private strings: Map<bigint, string> = new Map();
   private lastMemName: bigint = 0n;
+  private callstacks: Map<bigint, CallstackFrame[]> = new Map();
 
   // Parse memory events from decompressed trace data
   parseMemoryEvents(data: Buffer): MemoryStats {
@@ -254,6 +264,28 @@ export class TracyMemoryParser {
             break;
           }
 
+          case MemEventType.MemCallstack: {
+            // ptr(8) + frameCount(1) + [funcPtr(8) + filePtr(8) + line(4)] × N
+            if (offset + 9 > data.length) { offset = this.skipToEnd(data, offset); break; }
+            const ptr = this.readUInt64(data, offset);
+            const frameCount = data[offset + 8];
+            offset += 9;
+            const frames: CallstackFrame[] = [];
+            for (let f = 0; f < frameCount && offset + 20 <= data.length; f++) {
+              const funcPtr = this.readUInt64(data, offset);
+              const filePtr = this.readUInt64(data, offset + 8);
+              const line    = data.readUInt32LE(offset + 16);
+              offset += 20;
+              frames.push({
+                fn:   this.strings.get(funcPtr)  ?? `0x${funcPtr.toString(16)}`,
+                file: this.strings.get(filePtr)  ?? `0x${filePtr.toString(16)}`,
+                line,
+              });
+            }
+            this.callstacks.set(ptr, frames);
+            break;
+          }
+
           default:
             // Unknown event type, skip it
             // Most events are small (< 32 bytes)
@@ -324,6 +356,11 @@ export class TracyMemoryParser {
       }
     }
 
+    for (const leak of leaks) {
+      const cs = this.callstacks.get(leak.address);
+      if (cs) leak.callstack = cs;
+    }
+
     const currentUsage = this.totalAllocated - this.totalFreed;
 
     return {
@@ -355,6 +392,7 @@ export class TracyMemoryParser {
           severity: 'high',
           address: leak.address,
           size: leak.size,
+          callstack: leak.callstack,
           description: `Memory leak: ${(leak.size / 1024).toFixed(1)}KB at 0x${leak.address.toString(16)}${leak.name ? ` (${leak.name})` : ''}`,
           recommendation: 'Ensure proper deallocation or use smart pointers/RAII'
         });
@@ -444,6 +482,12 @@ export class TracyMemoryParser {
 
       output += `${icon} #${i + 1}: ${issue.type.toUpperCase()}\n`;
       output += `   ${issue.description}\n`;
+      if (issue.callstack && issue.callstack.length > 0) {
+        output += `   Callstack:\n`;
+        for (const frame of issue.callstack) {
+          output += `     ${frame.fn.padEnd(40)}  [${frame.file}:${frame.line}]\n`;
+        }
+      }
       if (issue.address !== 0n) {
         output += `   Address: 0x${issue.address.toString(16)}\n`;
       }

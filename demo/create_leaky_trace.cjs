@@ -104,6 +104,20 @@ function memFree(events, t, ptr, thread = THREAD_MAIN) {
   events.push(u64(Number(ptr)));
 }
 
+function memCallstack(events, ptr, frames) {
+  // Emit StringData for each unique function/file name, then the custom event.
+  const funcPtrs = frames.map(f => registerName(events, f.fn));
+  const filePtrs = frames.map(f => registerName(events, f.file));
+  events.push(Buffer.from([200]));           // MemCallstack type
+  events.push(u64(Number(ptr)));             // allocation ptr
+  events.push(Buffer.from([frames.length])); // frameCount
+  for (let i = 0; i < frames.length; i++) {
+    events.push(u64(Number(funcPtrs[i])));   // funcPtr
+    events.push(u64(Number(filePtrs[i])));   // filePtr
+    events.push(u32(frames[i].line));        // line
+  }
+}
+
 // ── scenario ─────────────────────────────────────────────────────────────────
 
 function buildEventStream() {
@@ -115,8 +129,23 @@ function buildEventStream() {
   // ── 1. TextureCache — loads 3 textures, NEVER frees them ─────────────────
   //    Simulates a cache that doesn't have an eviction policy.
   const tex1 = nextPtr(); memAllocNamed(events, tick(1e6),  tex1, 512*512*4,    'TextureCache/skybox.dds');
+  memCallstack(events, tex1, [
+    {fn: 'Texture::AllocPixelData',   file: 'texture.cpp',       line: 42},
+    {fn: 'TextureCache::Load',        file: 'texture_cache.cpp', line: 89},
+    {fn: 'GameEngine::LoadAssets',    file: 'engine.cpp',        line: 234},
+  ]);
   const tex2 = nextPtr(); memAllocNamed(events, tick(2e6),  tex2, 1024*1024*4,  'TextureCache/terrain_diffuse.dds');
+  memCallstack(events, tex2, [
+    {fn: 'Texture::AllocPixelData',   file: 'texture.cpp',       line: 42},
+    {fn: 'TextureCache::Load',        file: 'texture_cache.cpp', line: 96},
+    {fn: 'LevelManager::LoadChunk',   file: 'level_manager.cpp', line: 178},
+  ]);
   const tex3 = nextPtr(); memAllocNamed(events, tick(1e6),  tex3, 2048*2048*4,  'TextureCache/terrain_normal.dds');
+  memCallstack(events, tex3, [
+    {fn: 'Texture::AllocPixelData',   file: 'texture.cpp',       line: 42},
+    {fn: 'TextureCache::Load',        file: 'texture_cache.cpp', line: 96},
+    {fn: 'LevelManager::LoadChunk',   file: 'level_manager.cpp', line: 179},
+  ]);
   // tex1: 1 MB, tex2: 4 MB, tex3: 16 MB  →  21 MB leaked
 
   // ── 2. SceneGraph — allocates 20 nodes, forgets to free 10 ───────────────
@@ -162,6 +191,15 @@ function buildEventStream() {
   }
   // 300 × 256 B = 75 KB leaked
 
+  // Representative callstack for leaked ShaderConstants
+  if (shaderPtrs.length > 200) {
+    memCallstack(events, shaderPtrs[200], [
+      {fn: 'DrawCallRecorder::AllocConstants', file: 'draw_call.cpp',   line: 67},
+      {fn: 'RenderQueue::Submit',              file: 'render_queue.cpp', line: 112},
+      {fn: 'Renderer::DrawFrame',              file: 'renderer.cpp',     line: 298},
+    ]);
+  }
+
   // ── 6. AudioBuffer — 1 MB per frame × 30 frames, all freed (healthy) ─────
   for (let frame = 0; frame < 30; frame++) {
     const ab = nextPtr();
@@ -187,7 +225,16 @@ function buildEventStream() {
   // ── 8. Circular-reference simulation — RefCounted objects ─────────────────
   //    Two objects hold shared_ptr to each other → ref counts never hit zero.
   const objA = nextPtr(); memAllocNamed(events, tick(200_000), objA, 4*1024*1024, 'RefCounted/PhysicsWorld');
+  memCallstack(events, objA, [
+    {fn: 'PhysicsWorld::PhysicsWorld', file: 'physics_world.cpp', line: 15},
+    {fn: 'Scene::Init',                file: 'scene.cpp',         line: 83},
+  ]);
   const objB = nextPtr(); memAllocNamed(events, tick(100_000), objB, 2*1024*1024, 'RefCounted/CollisionMesh');
+  memCallstack(events, objB, [
+    {fn: 'CollisionMesh::CollisionMesh', file: 'collision_mesh.cpp', line: 22},
+    {fn: 'PhysicsWorld::RegisterBody',   file: 'physics_world.cpp',  line: 57},
+    {fn: 'Scene::Init',                  file: 'scene.cpp',          line: 84},
+  ]);
   // Neither is freed — simulates circular shared_ptr cycle (6 MB leaked)
 
   // ── 9. Giant temporary — image decode scratch buffer (healthy) ────────────
