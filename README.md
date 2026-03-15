@@ -1,59 +1,35 @@
 # Tracy MCP Server
 
 Model Context Protocol server for [Tracy Profiler](https://github.com/wolfpld/tracy) `.tracy` trace files.
+Lets Claude read real performance traces and help you find and fix problems.
 
-Lets Claude analyse real performance traces — find slow zones, memory leaks, and timing outliers.
+## Setup
 
-## Requirements
-
-- Node.js ≥ 18
-- Tracy Profiler built from source (this repo)
-- `tracy-capture` and `tracy-csvexport` binaries (see below)
-
-## Build
+### 1. Build dependencies
 
 ```bash
-# 1. Build tracy-csvexport (needed to parse real .tracy files)
+# tracy-csvexport — needed to parse real .tracy save files
 cd /path/to/tracy/csvexport
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j4
+cmake --build build -j$(nproc)
 
-# 2. Build tracy-capture (needed to record traces)
+# tracy-capture — needed to record traces from running apps
 cd /path/to/tracy/capture
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j4
+cmake --build build -j$(nproc)
+```
 
-# 3. Install MCP server dependencies
+### 2. Install and build the MCP server
+
+```bash
 cd /path/to/tracy/tracymcp
 npm install
 npm run build
 ```
 
-## Recording a Trace
+### 3. Register with Claude Code
 
-Instrument your app with Tracy (`TRACY_ENABLE`, `TracyCZoneN` / `ZoneScoped`), then capture:
-
-```bash
-# Start capture (waits for app to connect, saves on exit)
-tracy-capture -o my_trace.tracy -f
-
-# In another terminal — run your app
-./my_app
-```
-
-The capture process exits automatically when the app disconnects and saves `my_trace.tracy`.
-
-### Demo
-
-```bash
-cd tracymcp/demo
-make            # Builds demo binary with Tracy zones
-make run        # Run demo (must have tracy-capture running first)
-```
-
-## Configure Claude Code
-
-Add to `~/.claude.json` (or project `.claude/settings.json`):
+Add to `~/.claude.json` (global) or `.claude/settings.json` (project):
 
 ```json
 {
@@ -66,175 +42,311 @@ Add to `~/.claude.json` (or project `.claude/settings.json`):
 }
 ```
 
-Then restart Claude Code. The MCP tools appear automatically.
+Restart Claude Code. The tools are available immediately.
 
-## Tools
+---
 
-### CPU Profiling
+## Recording a Trace
 
-#### `find_problematic_zones`
+Instrument your app with Tracy macros, then capture while it runs:
 
-Find zones that exceed timing thresholds. The main tool for performance work.
+```bash
+# Terminal 1 — start capture (waits for app, saves on disconnect)
+tracy-capture -o my_trace.tracy -f
 
-```
-find_problematic_zones(
-  path: "/path/to/trace.tracy",
-  max_total_time_ms: 20,   // flag zones slower than 20ms total (default: 50)
-  max_avg_time_ms: 5,      // flag zones slower than 5ms avg   (default: 10)
-  min_count: 1             // ignore zones with fewer calls     (default: 1)
-)
+# Terminal 2 — run your app
+./my_app
 ```
 
-Output example:
+When your app exits, `my_trace.tracy` is saved automatically. Pass that path to any tool below.
+
+### Quick demo
+
+```bash
+cd tracymcp/demo
+make          # build demo C program
+make run      # run it (requires tracy-capture running in another terminal)
+```
+
+---
+
+## Debugging with Claude
+
+The intended workflow is: record a trace, hand the path to Claude, describe the symptom.
+Claude picks the right tool(s), interprets the numbers, and tells you what to fix.
+
+### "My app is slow — what's taking the most time?"
+
+```
+find_problematic_zones(path="/traces/my_trace.tracy")
+```
+
+You get a ranked list of slow zones with severity, timings, and a suggested fix:
+
 ```
 Found 3 problematic zone(s):
 
-🔴 #1: database_query (demo.c:86)
-   Issues:
-   • High total time: 66.28ms
-   • High average time: 66.28ms
-   Stats: 1 call, avg: 66.28ms, min: 66.28ms, max: 66.28ms, total: 66.28ms
+🔴 #1: database_query  (main.cpp:86)
+   • High total time: 66.28 ms
+   • High average time: 66.28 ms
+   Stats: 1 call, avg 66.28 ms, min 66.28 ms, max 66.28 ms
    💡 Consider caching results or moving to background thread
 
-🔴 #2: heavy_work (demo.c:12)
-   ...
+🟡 #2: render  (renderer.cpp:210)
+   • P90 outlier: 12.4 ms (avg is 2.1 ms)
+   Stats: 847 calls, avg 2.1 ms, min 0.8 ms, max 18.3 ms
+   💡 Investigate occasional spikes — may be GC or lock contention
+
+🟢 #3: physics_update  (physics.cpp:44)
+   • Inconsistent timing (CV: 94%)
+   Stats: 847 calls, avg 1.2 ms, min 0.1 ms, max 9.7 ms
+   💡 Check for variable-sized work batches or lock contention
 ```
 
-Severity is assigned automatically:
-- 🔴 **high** — exceeds total time threshold
-- 🟡 **medium** — exceeds average time or has P90 outliers
-- 🟢 **low** — inconsistent timing (high CV)
-
-#### `get_zone_stats`
-
-Detailed statistics for a single zone by name.
+Tighten the thresholds if your app has a strict frame budget:
 
 ```
-get_zone_stats(
-  path: "/path/to/trace.tracy",
-  zone: "database_query"
+find_problematic_zones(
+  path="/traces/my_trace.tracy",
+  max_total_time_ms=16,    # flag anything over 16 ms total
+  max_avg_time_ms=2        # flag anything averaging over 2 ms
 )
 ```
 
-Output includes min/max/avg/stddev and, for zones called many times, percentiles:
+---
+
+### "I need full stats for one specific function"
+
 ```
-Zone: database_query
-Location: demo.c:86
+get_zone_stats(path="/traces/my_trace.tracy", zone="render")
+```
+
+```
+Zone: render
+Location: renderer.cpp:210
 
 Statistics
 ----------
-Calls: 1000
-Total Time: 1234.567 ms
-Average Time: 1.235 ms
+Calls: 847
+Total Time: 1779.370 ms
+Average Time: 2.101 ms
 Min Time: 0.812 ms
-Max Time: 45.210 ms
-Std Dev: 2.341 ms
-Coefficient of Variation: 189.6%
-P50: 0.934 ms
-P90: 2.187 ms
-P99: 18.432 ms
+Max Time: 18.347 ms
+Std Dev: 1.834 ms
+Coefficient of Variation: 87.3%
+P50: 1.540 ms
+P90: 4.210 ms
+P99: 12.860 ms
 ```
 
-#### `list_zones`
+A high P99 with a low average means rare but severe spikes — worth investigating separately.
+If the same zone name appears at multiple source locations (e.g. `render` defined in five files),
+all of them are shown with their `[1/5]` prefix.
 
-List all zone names in a trace, with optional filter.
+---
 
-```
-list_zones(path: "/path/to/trace.tracy", filter: "render")
-```
-
-#### `read_trace`
-
-Basic file info: compression type, size, estimated event count.
+### "What zones exist in this trace?"
 
 ```
-read_trace(path: "/path/to/trace.tracy")
+list_zones(path="/traces/my_trace.tracy")
+list_zones(path="/traces/my_trace.tracy", filter="render")  # narrow down
 ```
 
-### Memory Profiling
+Use this to explore unfamiliar traces or find the exact name to pass to `get_zone_stats`.
 
-#### `get_memory_stats`
+---
 
-Allocation summary for a trace.
+### "I suspect a memory leak — where is it?"
 
 ```
-get_memory_stats(path: "/path/to/trace.tracy")
+get_memory_stats(path="/traces/my_trace.tracy")
 ```
 
 ```
 Memory Statistics
 ==================
-Total Allocated: 33.10 MB
-Total Freed: 21.10 MB
-Current Usage: 12.00 MB
-Peak Usage: 32.00 MB
-Allocations: 25
-Frees: 23
-Potential Leaks: 2
+Total Allocated: 180.99 MB
+Total Freed: 151.59 MB
+Current Usage: 29.40 MB
+Peak Usage: 93.40 MB
+Allocations: 624
+Frees: 261
+Potential Leaks: 363
 ```
 
-#### `find_memory_leaks`
+If `Current Usage` is much higher than expected, or `Potential Leaks` is nonzero, dig in:
 
-Find allocations never freed and usage spikes.
+```
+find_memory_leaks(path="/traces/my_trace.tracy")
+```
+
+```
+Found 5 memory issue(s):
+
+🔴 #1: LEAK
+   Memory leak: 16384.0 KB at 0x10003000 (TextureCache/terrain_normal.dds)
+   💡 Ensure proper deallocation or use smart pointers/RAII
+
+🔴 #2: LEAK
+   Memory leak: 4096.0 KB at 0x10002000 (TextureCache/terrain_diffuse.dds)
+   💡 Ensure proper deallocation or use smart pointers/RAII
+
+🟡 #3: SPIKE
+   Memory spike: peak was 93.4 MB, now 29.4 MB
+   💡 Investigate temporary allocations — consider reusing memory or object pooling
+```
+
+By default only leaks > 1 MB are shown. Lower the threshold to catch smaller ones:
 
 ```
 find_memory_leaks(
-  path: "/path/to/trace.tracy",
-  max_leak_size_mb: 1,    // report leaks larger than 1MB (default: 1)
-  max_usage_mb: 100       // flag if peak usage exceeds 100MB (default: 100)
+  path="/traces/my_trace.tracy",
+  max_leak_size_mb=0.064    # show everything above 64 KB
 )
 ```
 
-## How It Works
+---
 
-`.tracy` files are the Tracy server's serialised state (not raw events). The MCP server:
-
-1. Detects real Tracy save files by checking for the `"tracy\0"` magic after decompression
-2. Delegates to `tracy-csvexport` which uses `TracyWorker` to fully parse the binary format
-3. Runs both aggregated (`-` default) and per-call (`-u`) exports to compute percentiles
-4. Synthetic test traces (raw event streams) are parsed by the built-in binary parser
+### Typical debugging session
 
 ```
-.tracy file
-    ├── is real save file? → tracy-csvexport → parse CSV → ZoneTiming map
-    └── is synthetic?      → built-in binary parser      → ZoneTiming map
+# 1. Orient — what kind of file is this?
+read_trace(path="/traces/my_trace.tracy")
+
+# 2. Explore — what zones are instrumented?
+list_zones(path="/traces/my_trace.tracy")
+
+# 3. Find hot spots
+find_problematic_zones(path="/traces/my_trace.tracy", max_total_time_ms=10)
+
+# 4. Drill into the worst offender
+get_zone_stats(path="/traces/my_trace.tracy", zone="database_query")
+
+# 5. Check for memory problems
+get_memory_stats(path="/traces/my_trace.tracy")
+find_memory_leaks(path="/traces/my_trace.tracy", max_leak_size_mb=0.1)
 ```
 
-## Percentiles (P50/P90/P99)
+---
 
-For zones called more than once, the server computes percentiles from individual call data:
+## Automatic new/delete Tracking
 
-- **P50** — median call time
-- **P90** — 90th percentile (most calls are faster than this)
-- **P99** — 99th percentile (useful for finding tail latency)
-
-A zone with low average but high P99 indicates rare but severe spikes — flagged as a medium-severity issue.
-
-## Testing
-
-```bash
-npm test             # run all 67 tests
-npm run test:watch   # watch mode
-npm run test:coverage
-```
-
-Tests use synthetic `.tracy` files (raw event streams) so they don't depend on a built Tracy installation.
-
-## TracyMemPro Instrumentation
-
-For automatic `new`/`delete` tracking without modifying every callsite:
+To track every allocation without touching every callsite, use `TracyMemPro.hpp`:
 
 ```cpp
+// At the top of one .cpp file (e.g. main.cpp)
 #define TRACY_MEMPRO_ENABLE
 #define TRACY_MEMPRO_OVERRIDE_NEW_DELETE
 #include "TracyMemPro.hpp"
 
-// All allocations are now tracked automatically
-MyClass* obj = new MyClass();
-delete obj;
+// Nothing else to change — all new/delete are now reported to Tracy
+MyClass* obj = new MyClass();   // tracked
+delete obj;                     // tracked
 ```
 
-See [`instrument/README.md`](instrument/README.md) for build instructions and full API.
+The allocations show up in `find_memory_leaks` with their source name attached.
+See [`instrument/README.md`](instrument/README.md) for the full API, custom allocator hooks,
+and build instructions.
+
+---
+
+## How It Works
+
+`.tracy` save files contain Tracy's serialised worker state, not raw events.
+The server handles two formats transparently:
+
+```
+.tracy file
+  ├── magic == "tracy\0" after decompress?
+  │     YES → delegate to tracy-csvexport → parse CSV → zone timings
+  └──   NO  → built-in binary parser (synthetic / test traces)
+```
+
+For real save files the server runs `tracy-csvexport` twice:
+- default mode → aggregated stats (total, avg, min, max, stddev)
+- `-u` mode → one row per call → used to compute P50/P90/P99
+
+Memory tools (`get_memory_stats`, `find_memory_leaks`) only work on synthetic
+event-stream traces because real save files store memory data in a format that
+`tracy-csvexport` does not expose. Instrument and capture a dedicated memory
+trace if you need this on a real app — see the `instrument/` directory.
+
+---
+
+## Reference
+
+### `find_problematic_zones`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `path` | string | required | Path to `.tracy` file |
+| `max_total_time_ms` | number | 50 | Flag zones with total time above this |
+| `max_avg_time_ms` | number | 10 | Flag zones with average time above this |
+| `min_count` | number | 1 | Ignore zones called fewer times than this |
+
+Severity levels:
+- 🔴 **high** — total time exceeds threshold
+- 🟡 **medium** — average time exceeds threshold, or P90 >> average
+- 🟢 **low** — high coefficient of variation (inconsistent timing)
+
+### `get_zone_stats`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `path` | string | required | Path to `.tracy` file |
+| `zone` | string | required | Zone name (exact match) |
+
+Returns all zones with that name. If a name appears at multiple source locations
+(e.g. `render` defined in five translation units), each is shown separately.
+
+### `list_zones`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `path` | string | required | Path to `.tracy` file |
+| `filter` | string | — | Case-insensitive substring filter |
+
+### `read_trace`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `path` | string | required | Path to `.tracy` file |
+
+Returns file type, compression, stream count, sizes.
+
+### `get_memory_stats`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `path` | string | required | Path to `.tracy` file |
+
+Returns total allocated/freed, current and peak usage, allocation/free counts,
+and leak count.
+
+### `find_memory_leaks`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `path` | string | required | Path to `.tracy` file |
+| `max_leak_size_mb` | number | 1 | Only report leaks larger than this (MB) |
+| `max_usage_mb` | number | 100 | Flag if peak usage exceeds this (MB) |
+
+Reports leaks with address and name (if instrumented with `TracyMemPro`),
+usage spikes, and fragmentation patterns.
+
+---
+
+## Testing
+
+```bash
+npm test              # 67 unit + integration tests
+npm run test:watch    # watch mode
+npm run test:coverage # coverage report
+```
+
+Tests use synthetic event-stream traces — no Tracy installation needed.
+
+---
 
 ## License
 

@@ -1,228 +1,341 @@
-# TracyMemPro - MemPro-style Memory Instrumentation for Tracy
+# TracyMemPro — automatic new/delete tracking for Tracy
 
-MemPro-inspired automatic memory leak detection and profiling for Tracy Profiler.
+Drop-in header that hooks `operator new` and `operator delete` globally so every
+heap allocation in your program is automatically reported to Tracy Profiler.
+No need to sprinkle `TracyAlloc`/`TracyFree` at every callsite.
 
-## Features
+Designed for debug builds. Zero overhead when disabled.
 
-- **Automatic Allocation Tracking** - Override `operator new/delete` to track all allocations
-- **Callstack Capture** - See exactly where each allocation happened
-- **Leak Detection** - Find memory leaks via Tracy Profiler or Tracy MCP server
-- **Zero Overhead When Disabled** - Compile-time instrumentation with stub implementations
-- **Compatible with Tracy** - Uses existing Tracy memory profiling macros
+---
 
-## Quick Start
+## Quick start
 
-### 1. Basic Usage
+Add two defines before the include in **one** `.cpp` file (e.g. `main.cpp`):
 
 ```cpp
 #define TRACY_MEMPRO_ENABLE
 #define TRACY_MEMPRO_OVERRIDE_NEW_DELETE
 #include "TracyMemPro.hpp"
+```
 
-int main() {
-    // All new/delete are now tracked automatically
-    int* data = new int[1000];  // Tracked with callstack
-    delete[] data;              // Tracked
+That's it. Every subsequent `new`/`delete` anywhere in your program is now
+tracked. Run your app with tracy-capture running, save the trace, then:
 
-    // Named allocations
-    TracyMemPro::TrackAlloc(buffer, size, "MyBuffer");
-    TracyMemPro::TrackFree(buffer);
+```
+find_memory_leaks(path="my_trace.tracy", max_leak_size_mb=0.1)
+```
 
-    return 0;
+---
+
+## Build
+
+```bash
+# Minimal — link against TracyClient (shared or static)
+g++ -std=c++17 -O2 \
+    -DTRACY_MEMPRO_ENABLE -DTRACY_MEMPRO_OVERRIDE_NEW_DELETE \
+    -DTRACY_ENABLE \
+    -I/path/to/tracy/public \
+    main.cpp -o my_app \
+    -L/path/to/tracy/build -lTracyClient -lpthread -ldl
+
+# Or with CMake — just add to your target:
+target_compile_definitions(my_app PRIVATE
+    TRACY_ENABLE
+    TRACY_MEMPRO_ENABLE
+    TRACY_MEMPRO_OVERRIDE_NEW_DELETE
+)
+target_include_directories(my_app PRIVATE /path/to/tracy/tracymcp/instrument)
+```
+
+Debug builds only — add a guard in your CMakeLists:
+
+```cmake
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_compile_definitions(my_app PRIVATE
+        TRACY_ENABLE TRACY_MEMPRO_ENABLE TRACY_MEMPRO_OVERRIDE_NEW_DELETE)
+endif()
+```
+
+---
+
+## Debugging a memory leak step by step
+
+### 1. Reproduce the leak
+
+Run your app normally. If you already know "memory grows over time" or
+"valgrind says X bytes leaked" — that's your reproduction case.
+
+### 2. Capture a trace
+
+```bash
+# Terminal 1
+tracy-capture -o leak_hunt.tracy -f
+
+# Terminal 2 — run the scenario that produces the leak
+./my_app --scenario load-and-unload-assets
+```
+
+### 3. Ask Claude to find the leaks
+
+```
+find_memory_leaks(path="leak_hunt.tracy", max_leak_size_mb=0.064)
+```
+
+Output with TracyMemPro names attached:
+
+```
+🔴 #1: LEAK
+   Memory leak: 16384.0 KB at 0x10003000 (TextureCache/terrain_normal.dds)
+   💡 Ensure proper deallocation or use smart pointers/RAII
+
+🔴 #2: LEAK
+   Memory leak: 4096.0 KB at 0x10002000 (TextureCache/terrain_diffuse.dds)
+   💡 Ensure proper deallocation or use smart pointers/RAII
+
+🟡 #3: SPIKE
+   Memory spike: peak was 93.4 MB, now 29.4 MB
+   💡 Investigate temporary allocations — consider reusing memory or object pooling
+```
+
+The name in parentheses comes from `TRACY_MEMPRO_ALLOC_NAMED` (see below).
+Without it you still get the address, which you can look up in the Tracy GUI.
+
+### 4. Narrow down with named allocations
+
+Once you know which subsystem leaks, add names to its allocator:
+
+```cpp
+// Before (anonymous):
+void* Texture::AllocPixelData(size_t bytes) {
+    return ::operator new(bytes);
+}
+
+// After (named — shows up in MCP output):
+void* Texture::AllocPixelData(size_t bytes) {
+    void* p = ::operator new(bytes);
+    TRACY_MEMPRO_ALLOC_NAMED(p, bytes, "TextureCache");
+    return p;
+}
+void Texture::FreePixelData(void* p) {
+    TRACY_MEMPRO_FREE(p);
+    ::operator delete(p);
 }
 ```
 
-### 2. Manual Tracking
+---
 
-For custom allocators or non-C++ allocations:
+## API
 
-```cpp
-void* ptr = malloc(1024);
-TRACY_MEMPRO_ALLOC(ptr, 1024);  // Track with name "ptr"
-TRACY_MEMPRO_FREE(ptr);
-free(ptr);
-```
-
-### 3. Named Allocations
+### Global new/delete hooks (automatic, opt-in)
 
 ```cpp
-Texture* tex = malloc(sizeof(Texture));
-TRACY_MEMPRO_ALLOC_NAMED(tex, sizeof(Texture), "Texture:grass.png");
+#define TRACY_MEMPRO_OVERRIDE_NEW_DELETE
 ```
 
-## Configuration Options
+Overrides `operator new`, `operator new[]`, `operator delete`, `operator delete[]`
+globally. Every allocation ≥ `TRACY_MEMPRO_MIN_ALLOC_SIZE` (default: 64 bytes)
+is reported to Tracy.
 
-| Macro | Default | Description |
-|-------|---------|-------------|
-| `TRACY_MEMPRO_ENABLE` | `0` | Enable instrumentation (set to 1) |
-| `TRACY_MEMPRO_OVERRIDE_NEW_DELETE` | `0` | Override global new/delete |
-| `TRACY_MEMPRO_MIN_ALLOC_SIZE` | `64` | Only track allocations ≥ this size |
-
-## Building
-
-```bash
-# Build the demo
-make
-
-# Run with Tracy Profiler
-make run
-```
-
-## Analyzing Results
-
-### Via Tracy Profiler GUI
-
-1. Run your application with Tracy Profiler connected
-2. Check the **Memory** tab for allocations and leaks
-3. Click on allocations to see callstacks
-
-### Via Tracy MCP Server
-
-```bash
-# After saving your trace as my_app.tracy
-
-# Get memory statistics
-get_memory_stats(path="my_app.tracy")
-
-# Find leaks
-find_memory_leaks(path="my_app.tracy", max_leak_size_mb=0.1)
-```
-
-Output:
-```
-Found 5 memory issue(s):
-
-🔴 #1: LEAK
-   Memory leak: 4096.0KB at 0x7f8a4c000000
-   Callstack: operator new → Texture::Texture → LoadTexture
-   💡 Ensure proper deallocation or use smart pointers/RAII
-```
-
-## How It Works
-
-```
-┌─────────────────┐      ┌──────────────────┐      ┌─────────────────┐
-│  Application    │      │  TracyMemPro     │      │  Tracy Profiler │
-│                 │      │                  │      │                 │
-│ new/delete  ────┼─────>│ TrackAlloc/Free  ─────>│ Memory Events   │
-│ malloc/calloc  ──┼─────>│ Capture Callstack ─────>│ Leak Detection  │
-│ custom alloc   ───┼────>│ Send to Profiler ─────>│ Callstack View  │
-└─────────────────┘      └──────────────────┘      └─────────────────┘
-```
-
-### Memory Leak Detection Flow
-
-1. **Allocation**: `operator new` → `TrackAlloc()` → Tracy captures address + size + callstack
-2. **Deallocation**: `operator delete` → `TrackFree()` → Tracy marks address as freed
-3. **Analysis**: Tracy matches allocs with frees; unmatched = leak
-4. **Reporting**: View leaks with full callstacks in Profiler or via MCP tools
-
-## Comparison with MemPro
-
-| Feature | TracyMemPro | MemPro |
-|---------|-------------|--------|
-| Callstack capture | ✅ Tracy built-in | ✅ Custom implementation |
-| Network streaming | ✅ Tracy protocol | ✅ Custom protocol |
-| Dump file support | ✅ .tracy format | ✅ .mempro_dump |
-| Profiler UI | ✅ Tracy Profiler | ✅ MemPro app |
-| MCP Integration | ✅ Yes | ❌ No |
-| License | BSD-3-Clause | Custom |
-
-## Advanced Usage
-
-### Tracking Specific Allocators
+### Manual tracking for custom allocators
 
 ```cpp
-class MyAllocator {
-    void* Allocate(size_t size) {
-        void* ptr = malloc(size);
-        TRACY_MEMPRO_ALLOC_NAMED(ptr, size, "MyAllocator");
-        return ptr;
+// Track a raw malloc / custom allocator
+void* p = my_pool.Alloc(size);
+TRACY_MEMPRO_ALLOC(p, size);          // anonymous
+TRACY_MEMPRO_ALLOC_NAMED(p, size, "MyPool");  // with name
+
+// Track the free
+my_pool.Free(p);
+TRACY_MEMPRO_FREE(p);
+```
+
+### Named allocation RAII helper
+
+Tracks allocation on construction, free on destruction:
+
+```cpp
+{
+    TRACY_MEMPRO_SCOPE(tracker, buffer, 1024 * 1024);
+    // buffer is tracked as long as tracker is alive
+}   // automatically reports free here
+```
+
+### C++ class-level tracking
+
+Override `operator new`/`delete` for a specific class only:
+
+```cpp
+class Texture {
+public:
+    void* operator new(size_t size) {
+        void* p = ::operator new(size);
+        TracyMemPro::TrackAlloc(p, size, "Texture");
+        return p;
     }
-
-    void Free(void* ptr) {
-        TRACY_MEMPRO_FREE(ptr);
-        free(ptr);
+    void operator delete(void* p) noexcept {
+        TracyMemPro::TrackFree(p);
+        ::operator delete(p);
     }
 };
 ```
 
-### RAII Helper
+---
+
+## Configuration
+
+Set these before including `TracyMemPro.hpp`:
+
+| Macro | Default | Description |
+|-------|---------|-------------|
+| `TRACY_MEMPRO_ENABLE` | (unset) | Must be defined to enable anything |
+| `TRACY_MEMPRO_OVERRIDE_NEW_DELETE` | (unset) | Hook global `new`/`delete` |
+| `TRACY_MEMPRO_MIN_ALLOC_SIZE` | `64` | Ignore allocations smaller than this (bytes) |
+| `TRACY_MEMPRO_CALLSTACK_DEPTH` | (unset) | Capture N frames of callstack per alloc |
+
+#### Callstack capture
+
+Callstacks let you see exactly which function allocated the leaked memory.
+They add overhead — only use in debug:
 
 ```cpp
-{
-    TRACY_MEMPRO_SCOPE(tracker, buffer, 1024);
-    // buffer is tracked here
-    // automatically freed when scope ends
+#define TRACY_MEMPRO_CALLSTACK_DEPTH 16   // capture 16 frames
+#define TRACY_MEMPRO_ENABLE
+#define TRACY_MEMPRO_OVERRIDE_NEW_DELETE
+#include "TracyMemPro.hpp"
+```
+
+#### Tracking only large allocations
+
+To reduce noise from small allocations (strings, small containers):
+
+```cpp
+#define TRACY_MEMPRO_MIN_ALLOC_SIZE 4096  // only track ≥ 4 KB
+```
+
+---
+
+## Common patterns and bugs it finds
+
+### Forgotten destructor / missing delete
+
+```cpp
+class ResourceManager {
+    std::vector<Texture*> textures;
+public:
+    void Load(const char* path) {
+        textures.push_back(new Texture(path));  // tracked
+    }
+    ~ResourceManager() {
+        // forgot to delete textures — MCP finds this
+    }
+};
+```
+
+### Circular shared_ptr (reference cycle)
+
+```cpp
+struct Node {
+    std::shared_ptr<Node> next;
+    std::shared_ptr<Node> prev;
+};
+auto a = std::make_shared<Node>();
+auto b = std::make_shared<Node>();
+a->next = b;
+b->prev = a;
+// Both ref counts stay at 1 — memory never freed — MCP finds this
+```
+
+### Early-return skips free
+
+```cpp
+void ProcessRequest(Request* req) {
+    char* buf = new char[64 * 1024];   // tracked
+
+    if (!Validate(req)) return;        // BUG: buf leaks here
+
+    Process(buf, req);
+    delete[] buf;
 }
 ```
 
-### Disabling Tracking for Specific Allocations
+### Producer/consumer imbalance
 
 ```cpp
-// Allocations < 64 bytes are ignored by default
-// Change with TRACY_MEMPRO_MIN_ALLOC_SIZE
-
-// Or track manually only what you need
-#undef TRACY_MEMPRO_OVERRIDE_NEW_DELETE
+// Producer thread keeps going after consumer exits
+while (running) {
+    auto* pkt = new Packet(read_socket());
+    queue.push(pkt);    // tracked — but if consumer died, pkt never freed
+}
 ```
 
-## Demo Applications
+---
 
-### `demo_mempro.cpp`
+## Combining with CPU zone profiling
 
-Demonstrates:
-- ✅ Intentional leaks (textures, meshes, raw allocations)
-- ✅ Proper memory management (RAII, smart pointers)
-- ✅ Temporary allocations
-- ✅ Container allocations
+Tracy memory and CPU tracking work together in the same trace:
 
-Run with `make run` and capture in Tracy Profiler.
+```cpp
+void LoadLevel(const char* name) {
+    ZoneScopedN("LoadLevel");            // CPU timing zone
 
-## Tips and Best Practices
+    auto* mesh = new Mesh(name);         // memory tracked automatically
+    auto* shader = new Shader("pbr");    // memory tracked automatically
 
-1. **Enable in Debug Builds Only**
-   ```makefile
-   DEBUG_CXXFLAGS += -DTRACY_MEMPRO_ENABLE -DTRACY_MEMPRO_OVERRIDE_NEW_DELETE
-   ```
+    TRACY_MEMPRO_ALLOC_NAMED(mesh->vbo, mesh->vbo_size, "VBO");
+}
+```
 
-2. **Set Appropriate Minimum Size**
-   - Small allocations (< 64 bytes) create overhead
-   - Adjust `TRACY_MEMPRO_MIN_ALLOC_SIZE` based on your needs
+Then in a single trace you can see both where time is spent and where memory
+is allocated, and Claude can correlate them:
 
-3. **Use Named Allocations for Better Diagnostics**
-   ```cpp
-   // Instead of:
-   new Texture();
+```
+# Both tools on the same trace:
+find_problematic_zones(path="trace.tracy")
+find_memory_leaks(path="trace.tracy", max_leak_size_mb=0.1)
+```
 
-   // Use:
-   TRACY_MEMPRO_ALLOC_NAMED(ptr, size, "Texture:grass.png");
-   ```
-
-4. **Combine with Zone Profiling**
-   ```cpp
-   void LoadAssets() {
-       ZoneScoped;  // CPU timing
-       // Memory tracking happens automatically
-   }
-   ```
+---
 
 ## Troubleshooting
 
-### No allocations appearing
-- Ensure `TRACY_MEMPRO_ENABLE` is defined
-- Check Tracy Profiler is connected
+**No allocations appearing in Tracy / MCP output**
+- Check `TRACY_MEMPRO_ENABLE` is defined before the include
+- Check Tracy Profiler is connected before your app starts allocating
 - Verify allocations exceed `TRACY_MEMPRO_MIN_ALLOC_SIZE`
+- Make sure you're not running a Release build that strips Tracy
 
-### Missing callstacks
-- Ensure Tracy is built with callstack support
-- Check `TRACY_HAS_CALLSTACK` is defined
-- Try increasing callstack depth
+**Multiple definition errors at link time**
+- Include `TracyMemPro.hpp` in exactly **one** `.cpp` file
+- In all other files that need the macros, include it without the defines:
+  ```cpp
+  // other_file.cpp — just the macros, no operator new/delete override
+  #include "TracyMemPro.hpp"
+  ```
 
-### Build errors
-- Link against TracyClient library
-- Include Tracy headers: `-I/path/to/tracy/public`
-- Use C++17 or later: `-std=c++17`
+**Callstacks missing or truncated**
+- Build Tracy with `TRACY_HAS_CALLSTACK` defined (enabled by default on Linux/macOS)
+- Increase `TRACY_MEMPRO_CALLSTACK_DEPTH`
+- Build with `-g` and without `-fomit-frame-pointer`
+
+**My custom allocator bypasses the hooks**
+- `TRACY_MEMPRO_OVERRIDE_NEW_DELETE` only intercepts `operator new`/`delete`
+- For `malloc`/`free` or arena allocators, add `TRACY_MEMPRO_ALLOC` / `TRACY_MEMPRO_FREE` manually
+
+---
+
+## Demo
+
+```bash
+cd tracymcp/instrument
+make                 # build demo_mempro binary
+make run             # run it (requires tracy-capture in another terminal)
+```
+
+`demo_mempro.cpp` demonstrates intentional leaks (texture cache, raw allocations),
+correct RAII usage, smart pointers, and container allocations — useful as a
+reference for what the MCP output looks like for each pattern.
+
+---
 
 ## License
 
