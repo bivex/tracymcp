@@ -20,7 +20,7 @@ LIBS = -L$(TRACY_LIB_DIR) -lTracyClient -lpthread -ldl -lc++ -lstdc++
 
 all: build_all
 
-build_all: dirs $(DEMO_BUILD_DIR)/demo $(DEMO_BUILD_DIR)/demo_memory
+build_all: dirs $(DEMO_BUILD_DIR)/demo $(DEMO_BUILD_DIR)/demo_memory $(DEMO_BUILD_DIR)/bench
 
 dirs:
 	@mkdir -p $(DEMO_BUILD_DIR)
@@ -36,6 +36,16 @@ $(DEMO_BUILD_DIR)/demo_memory: demo_memory.c
 	@echo "Building memory profiling demo (C++)..."
 	@$(CXX) $(CXXFLAGS) $(INCLUDES) -I$(TRACY_ROOT)/public/tracy -o $@ $< $(LIBS)
 	@echo "Memory demo built: $@"
+
+# Build benchmark demo (C++ zones + threads + memory + frame marks)
+$(DEMO_BUILD_DIR)/bench: bench.cpp
+	@echo "Building bench demo..."
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< $(LIBS)
+	@echo "Bench demo built: $@"
+
+run_bench: $(DEMO_BUILD_DIR)/bench
+	@echo "Running bench (connect tracy-capture first)..."
+	@$(DEMO_BUILD_DIR)/bench
 
 run: $(DEMO_BUILD_DIR)/demo
 	@echo "Running CPU profiling demo..."

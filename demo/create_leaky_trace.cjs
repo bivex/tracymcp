@@ -232,7 +232,7 @@ function buildEventStream() {
   const objB = nextPtr(); memAllocNamed(events, tick(100_000), objB, 2*1024*1024, 'RefCounted/CollisionMesh');
   memCallstack(events, objB, [
     {fn: 'CollisionMesh::CollisionMesh', file: 'collision_mesh.cpp', line: 22},
-    {fn: 'PhysicsWorld::RegisterBody',   file: 'physics_world.cpp',  line: 57},
+    {fn: 'PhysicsWorld::',   file: 'physics_world.cpp',  line: 57},
     {fn: 'Scene::Init',                  file: 'scene.cpp',          line: 84},
   ]);
   // Neither is freed — simulates circular shared_ptr cycle (6 MB leaked)
