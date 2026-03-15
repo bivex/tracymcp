@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Compiled demo binaries
+demo/build/
+demo/demo
+demo/demo_memory
+instrument/demo_mempro
+
+# Captured trace files (too big / machine-specific)
+demo/*.tracy

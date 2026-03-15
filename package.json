@@ -1,0 +1,35 @@
+{
+  "name": "tracymcp",
+  "version": "0.1.0",
+  "description": "Tracy profiler MCP server",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "tracymcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "keywords": [
+    "mcp",
+    "tracy",
+    "profiler"
+  ],
+  "license": "BSD-3-Clause",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "@mongodb-js/zstd": "^7.0.0",
+    "@types/lz4": "^0.6.4",
+    "lz4": "^0.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.15",
+    "typescript": "^5.7.3",
+    "vitest": "^4.1.0"
+  }
+}
