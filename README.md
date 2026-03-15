@@ -385,17 +385,45 @@ and build instructions.
 
 ---
 
-## How It Works
+## Architecture
 
-`.tracy` save files contain Tracy's serialised worker state, not raw events.
-The server handles two formats transparently:
-
+```mermaid
+graph TD
+    Developer -->|uses| MCP_Client[Claude Code MCP Client]
+    MCP_Client -->|MCP tool calls| TracyMCP[TracyMCP Server]
+    
+    TracyMCP -->|reads| TraceFile[.tracy trace file]
+    TracyMCP -->|delegates to| Csvexport[tracy-csvexport]
+    
+    subgraph TracyMCP Components
+        MCP_Interface[MCP Interface<br/>@modelcontextprotocol/sdk]
+        TraceParser[Trace Parser<br/>Node.js child_process]
+        Analysis[Analysis Tools<br/>TypeScript modules]
+        Tests[Test Suite<br/>Vitest]
+        
+        MCP_Interface --> TraceParser
+        TraceParser --> Analysis
+        MCP_Interface --> Analysis
+        Analysis -->|returns| MCP_Interface
+        Tests -->|tests| TracyMCP
+    end
+    
+    Csvexport -->|CSV output| TraceParser
+    
+    style TracyMCP fill:#e1f5fe
+    style TraceFile fill:#f3e5f5
 ```
+
+The server handles two trace formats transparently:
+```
+
 .tracy file
   ├── magic == "tracy\0" after decompress?
   │     YES → delegate to tracy-csvexport → parse CSV → zone timings
   └──   NO  → built-in binary parser (synthetic / test traces)
 ```
+
+![TracyMCP Architecture](tracymcp-architecture.png)
 
 For real save files the server runs `tracy-csvexport` twice:
 - default mode → aggregated stats (total, avg, min, max, stddev)
