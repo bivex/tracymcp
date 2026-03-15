@@ -12,6 +12,11 @@ import * as path from "node:path";
 import { TracyReader, CompressionType } from "./reader.js";
 import { TracyAnalyzer } from "./analyzer.js";
 import { TracyMemoryParser } from "./memory.js";
+import { TracyMessageParser } from "./messages.js";
+import { TracyFrameParser } from "./frames.js";
+import { TracyPlotParser } from "./plots.js";
+import { TracyLockParser } from "./locks.js";
+import { TracyGpuParser } from "./gpu.js";
 
 const CSVEXPORT_BINARY = path.join(
   path.dirname(new URL(import.meta.url).pathname),
@@ -149,6 +154,66 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "number",
               description: "Maximum current usage threshold in MB (default: 100)",
             },
+          },
+          required: ["path"],
+        },
+      },
+      {
+        name: "list_messages",
+        description: "List TracyMessage/TracyMessageL log events from a trace with timestamps and severity",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Path to the .tracy file" },
+            filter: { type: "string", description: "Optional case-insensitive substring filter on message text" },
+            severity: { type: "string", description: "Minimum severity to show: Trace|Debug|Info|Warning|Error|Fatal (default: Trace)" },
+          },
+          required: ["path"],
+        },
+      },
+      {
+        name: "get_frame_stats",
+        description: "Get frame timing statistics from FrameMark events — FPS, frame time percentiles, dropped frames",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Path to the .tracy file" },
+          },
+          required: ["path"],
+        },
+      },
+      {
+        name: "get_plot_stats",
+        description: "Get statistics for TracyPlot custom metric streams",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Path to the .tracy file" },
+          },
+          required: ["path"],
+        },
+      },
+      {
+        name: "find_lock_contention",
+        description: "Find mutexes/locks with the most contention — total wait time, worst waits, contention count",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Path to the .tracy file" },
+            min_wait_ms: { type: "number", description: "Only show locks with total wait above this (default: 0.1)" },
+          },
+          required: ["path"],
+        },
+      },
+      {
+        name: "find_problematic_gpu_zones",
+        description: "Find GPU zones that exceed timing thresholds",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Path to the .tracy file" },
+            max_avg_time_ms: { type: "number", description: "Flag GPU zones averaging above this (default: 5)" },
+            max_total_time_ms: { type: "number", description: "Flag GPU zones with total time above this (default: 50)" },
           },
           required: ["path"],
         },
@@ -512,6 +577,140 @@ ${percentileLines}`;
           content: [{ type: "text", text: `Error analyzing memory leaks: ${error}` }],
           isError: true,
         };
+      }
+    }
+
+    case "list_messages": {
+      const { path, filter, severity } = args as { path: string; filter?: string; severity?: string };
+
+      if (!fs.existsSync(path)) {
+        return { content: [{ type: "text", text: `Error: File not found: ${path}` }], isError: true };
+      }
+
+      try {
+        const reader = new TracyReader(path);
+        const data = await reader.readAllData();
+        reader.close();
+
+        if (isRealSaveFile(data)) {
+          return {
+            content: [{ type: "text", text: "not supported for real Tracy save files — binary format not exposed by tracy-csvexport" }],
+          };
+        }
+
+        const parser = new TracyMessageParser();
+        const messages = parser.parse(data);
+        return { content: [{ type: "text", text: parser.format(messages, filter, undefined, severity) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error parsing messages: ${error}` }], isError: true };
+      }
+    }
+
+    case "get_frame_stats": {
+      const { path } = args as { path: string };
+
+      if (!fs.existsSync(path)) {
+        return { content: [{ type: "text", text: `Error: File not found: ${path}` }], isError: true };
+      }
+
+      try {
+        const reader = new TracyReader(path);
+        const data = await reader.readAllData();
+        reader.close();
+
+        if (isRealSaveFile(data)) {
+          return {
+            content: [{ type: "text", text: "not supported for real Tracy save files — binary format not exposed by tracy-csvexport" }],
+          };
+        }
+
+        const parser = new TracyFrameParser();
+        const stats = parser.parse(data);
+        return { content: [{ type: "text", text: parser.format(stats) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error parsing frame stats: ${error}` }], isError: true };
+      }
+    }
+
+    case "get_plot_stats": {
+      const { path } = args as { path: string };
+
+      if (!fs.existsSync(path)) {
+        return { content: [{ type: "text", text: `Error: File not found: ${path}` }], isError: true };
+      }
+
+      try {
+        const reader = new TracyReader(path);
+        const data = await reader.readAllData();
+        reader.close();
+
+        if (isRealSaveFile(data)) {
+          return {
+            content: [{ type: "text", text: "not supported for real Tracy save files — binary format not exposed by tracy-csvexport" }],
+          };
+        }
+
+        const parser = new TracyPlotParser();
+        const stats = parser.parse(data);
+        return { content: [{ type: "text", text: parser.format(stats) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error parsing plot stats: ${error}` }], isError: true };
+      }
+    }
+
+    case "find_lock_contention": {
+      const { path, min_wait_ms } = args as { path: string; min_wait_ms?: number };
+
+      if (!fs.existsSync(path)) {
+        return { content: [{ type: "text", text: `Error: File not found: ${path}` }], isError: true };
+      }
+
+      try {
+        const reader = new TracyReader(path);
+        const data = await reader.readAllData();
+        reader.close();
+
+        if (isRealSaveFile(data)) {
+          return {
+            content: [{ type: "text", text: "not supported for real Tracy save files — binary format not exposed by tracy-csvexport" }],
+          };
+        }
+
+        const parser = new TracyLockParser();
+        const locks = parser.parse(data);
+        return { content: [{ type: "text", text: parser.format(locks, min_wait_ms ?? 0.1) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error parsing lock contention: ${error}` }], isError: true };
+      }
+    }
+
+    case "find_problematic_gpu_zones": {
+      const { path, max_avg_time_ms, max_total_time_ms } = args as {
+        path: string;
+        max_avg_time_ms?: number;
+        max_total_time_ms?: number;
+      };
+
+      if (!fs.existsSync(path)) {
+        return { content: [{ type: "text", text: `Error: File not found: ${path}` }], isError: true };
+      }
+
+      try {
+        const reader = new TracyReader(path);
+        const data = await reader.readAllData();
+        reader.close();
+
+        if (isRealSaveFile(data)) {
+          return {
+            content: [{ type: "text", text: "not supported for real Tracy save files — binary format not exposed by tracy-csvexport" }],
+          };
+        }
+
+        const parser = new TracyGpuParser();
+        const zones = parser.parse(data);
+        return { content: [{ type: "text", text: parser.format(zones, max_avg_time_ms ?? 5, max_total_time_ms ?? 50) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error parsing GPU zones: ${error}` }], isError: true };
       }
     }
 
