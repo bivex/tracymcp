@@ -330,6 +330,181 @@ not CPU submission time.
 
 ---
 
+### "Show me the flame graph"
+
+```
+get_flame_graph(path="/traces/my_trace.tracy")
+get_flame_graph(path="/traces/my_trace.tracy", format="folded", max_depth=12)
+```
+
+```
+Flame Graph  (total captured: 635.83ms)
+
+├── frame [AppDelegate.swift:62]
+│       426.63ms (67.1%)  ×597  self=42.77ms (6.7%)
+│   ├── image_edge_detect [ImageScene.swift:97]
+│   │       150.87ms (23.7%)  ×60
+│   ├── image_box_blur [ImageScene.swift:51]
+│   │       140.77ms (22.1%)  ×60
+│   ├── image_sharpen [ImageScene.swift:79]
+│   │       67.35ms (10.6%)  ×60
+│   └── particle_update [ParticleScene.swift:44]
+│           4.07ms (0.6%)  ×179
+├── data_render [DataScene.swift:77]
+│       158.48ms (24.9%)  ×238
+└── particle_render [ParticleScene.swift:65]
+        49.29ms (7.8%)  ×181
+
+── Self-time hotspots (exclusive) ──────────────────
+   24.9%  158.48ms    data_render  DataScene.swift:77
+   23.7%  150.87ms    image_edge_detect  ImageScene.swift:97
+   22.1%  140.77ms    image_box_blur  ImageScene.swift:51
+```
+
+The flame graph reconstructs the call tree from per-call timing data. Width is inclusive time,
+children are nested under parents. The `self=` line shows exclusive time (time spent in the
+zone itself, not its children). Use `format="folded"` to output Brendan Gregg's folded
+stacks format for `flamegraph.pl` or `speedscope`.
+
+---
+
+### "What are the hottest functions by self time?"
+
+```
+get_top_table(path="/traces/my_trace.tracy")
+get_top_table(path="/traces/my_trace.tracy", limit=30)
+```
+
+```
+Top 13 zones by self (exclusive) time
+
+  #   Self%   Self ms   Incl%   Incl ms  ×Calls   Avg self  Name
+──────────────────────────────────────────────────────────────────────────────
+  1   24.9%   158.483   24.9%   158.483     238      0.666  █████  data_render
+                                          DataScene.swift:77
+  2   23.7%   150.868   23.7%   150.868      60      2.514  █████  image_edge_detect
+                                          ImageScene.swift:97
+  3   22.1%   140.774   22.1%   140.774      60      2.346  ████   image_box_blur
+                                          ImageScene.swift:51
+  4   10.6%    67.347   10.6%    67.347      60      1.122  ██     image_sharpen
+                                          ImageScene.swift:79
+  5    7.8%    49.294    7.8%    49.294     181      0.272  ██     particle_render
+                                          ParticleScene.swift:65
+  6    6.7%    42.768   67.1%   426.635     597      0.072  █      frame
+                                          AppDelegate.swift:62
+```
+
+The fastest way to find what's consuming CPU. Sorts by **self (exclusive) time** —
+the time spent in each zone *excluding* its children. If a zone takes 40% CPU on its own,
+it's a first candidate for optimization regardless of who calls it. The mini bar chart
+gives instant visual weight. Shows source location and call count.
+
+---
+
+### "Show me the icicle graph (top-down)"
+
+```
+get_icicle_graph(path="/traces/my_trace.tracy")
+get_icicle_graph(path="/traces/my_trace.tracy", width=120, max_depth=8, min_percent=0.3)
+```
+
+```
+Icicle Graph  (total: 635.83ms, width = 100 chars)
+
+(top → deep; width ∝ inclusive time)
+
+[frame 67%                                                               ][data_render 25%          ][parti…]
+[image_edge_detect 24%      ][image_box_blur 22%       ][image_shar…][i…]
+
+Depth: 2 level(s)  |  min_percent=0.5%
+```
+
+Like a flame graph but grows **top-down** from root to leaves. Width is proportional to
+inclusive time. Useful for reading the call stack in natural order (entry point → hot leaves).
+Good for "where does the time go inside frame?" questions.
+
+---
+
+### "Who calls whom? Show me the call graph"
+
+```
+get_call_graph(path="/traces/my_trace.tracy")
+get_call_graph(path="/traces/my_trace.tracy", format="dot")  # Graphviz DOT output
+```
+
+```
+Call Graph
+
+Nodes (sorted by self time):
+  Name                            Self%  Incl%      ×
+  ──────────────────────────────────────────────────────
+  data_render                     24.9%   24.9%    238  DataScene.swift:77
+  image_edge_detect               23.7%   23.7%     60  ImageScene.swift:97
+  image_box_blur                  22.1%   22.1%     60  ImageScene.swift:51
+  frame                            6.7%   67.1%    597  AppDelegate.swift:62
+  particle_update                  0.6%    0.6%    179  ParticleScene.swift:44
+
+Edges (sorted by time transferred, caller → callee):
+  Caller                    → Callee                         %      ×
+  ────────────────────────────────────────────────────────────────────
+  frame                     → image_edge_detect          23.7%     60
+  frame                     → image_box_blur             22.1%     60
+  frame                     → image_sharpen              10.6%     60
+  frame                     → image_to_cg                 3.2%    180
+  frame                     → particle_update             0.6%    179
+  prewarm                   → data_generate               0.2%      1
+```
+
+Reveals **who calls whom** with edge weights by time transferred. Use `format="dot"` to get
+Graphviz DOT output for visualization with `dot -Tsvg -o callgraph.svg`. Helps identify:
+- Multi-caller hot zones (zones called from many places)
+- Cyclic dependencies (A→B→A)
+- Unexpected call paths (who's actually calling this expensive function?)
+
+---
+
+### "How are my threads utilized?"
+
+```
+get_thread_profile(path="/traces/my_trace.tracy")
+```
+
+```
+Thread Profile  (trace span: 1800.30ms, 2 thread(s))
+
+Summary
+  Thread        Active ms  Util%  CPU utilization                  #Zones
+  ────────────────────────────────────────────────────────────────────────
+  Thread-2         154.56   8.6%  ███                                  15
+  Thread-1         152.35   8.5%  ███                                   1
+
+── Thread-2  (active 154.56ms  util   8.6%) ──
+   Name                          Self%  Self ms  Incl ms     ×  bar
+   ────────────────────────────────────────────────────────────────────────
+   geometry_pass                 23.2%   417.94   417.94   120  ███  bench.cpp:82
+   shadow_pass                   16.7%   300.01   300.01   120  ██   bench.cpp:78
+   narrow_phase                  14.1%   254.60   254.60   120  ██   bench.cpp:57
+   frame                          4.6%    81.94  1790.35   119  █    bench.cpp:168
+   ...
+
+── Thread-1  (active 152.35ms  util   8.5%) ──
+   Name                          Self%  Self ms  Incl ms     ×  bar
+   ────────────────────────────────────────────────────────────────────────
+   load_asset                     8.5%   152.35   152.35     4  █    bench.cpp:129
+
+No zones shared across threads — clean thread separation.
+```
+
+Per-thread profiling: shows **CPU utilization per thread**, zone breakdown with self/inclusive
+time per thread, and zones that appear on multiple threads. Diagnose:
+- **Load imbalance** — threads with vastly different utilization
+- **Thread starvation** — low utilization while others are busy
+- **Cross-thread zones** — same zone running on multiple threads (possible contention)
+
+Percentages are relative to the global trace span for meaningful cross-thread comparison.
+
+---
+
 ### Typical full debugging session
 
 ```
@@ -342,24 +517,37 @@ list_zones(path="/traces/my_trace.tracy")
 # 3. Find CPU hot spots (with thread names)
 find_problematic_zones(path="/traces/my_trace.tracy", max_total_time_ms=10)
 
-# 4. Drill into the worst offender
+# 4. Quick view: hottest functions by self time
+get_top_table(path="/traces/my_trace.tracy", limit=15)
+
+# 5. Understand the call tree
+get_flame_graph(path="/traces/my_trace.tracy")
+
+# 6. Check thread balance
+get_thread_profile(path="/traces/my_trace.tracy")
+
+# 7. Drill into the worst offender
 get_zone_stats(path="/traces/my_trace.tracy", zone="database_query")
 
-# 5. Check frame pacing
+# 8. Check frame pacing
 get_frame_stats(path="/traces/my_trace.tracy")
 
-# 6. Check GPU
+# 9. Check GPU
 find_problematic_gpu_zones(path="/traces/my_trace.tracy")
 
-# 7. Find lock bottlenecks
+# 10. Find lock bottlenecks
 find_lock_contention(path="/traces/my_trace.tracy")
 
-# 8. Check memory
+# 11. Check memory
 get_memory_stats(path="/traces/my_trace.tracy")
 find_memory_leaks(path="/traces/my_trace.tracy", max_leak_size_mb=0.1)
 
-# 9. Read log messages around the spike
+# 12. Read log messages around the spike
 list_messages(path="/traces/my_trace.tracy", severity="Warning")
+
+# 13. For visualization: export call graph as DOT
+get_call_graph(path="/traces/my_trace.tracy", format="dot") > callgraph.dot
+dot -Tsvg -o callgraph.svg callgraph.dot
 ```
 
 ---
@@ -399,12 +587,16 @@ graph TD
         MCP_Interface[MCP Interface<br/>@modelcontextprotocol/sdk]
         TraceParser[Trace Parser<br/>Node.js child_process]
         Analysis[Analysis Tools<br/>TypeScript modules]
+        FlameGraph[Flame Graph Builder<br/>Call tree reconstruction]
         Tests[Test Suite<br/>Vitest]
-        
+
         MCP_Interface --> TraceParser
         TraceParser --> Analysis
+        TraceParser --> FlameGraph
         MCP_Interface --> Analysis
+        MCP_Interface --> FlameGraph
         Analysis -->|returns| MCP_Interface
+        FlameGraph -->|returns| MCP_Interface
         Tests -->|tests| TracyMCP
     end
     
@@ -437,6 +629,9 @@ because `tracy-csvexport` does not expose this data:
 
 For these tools on a real app, instrument and capture a dedicated trace using the event types
 described in `instrument/` — or file an issue if you need csvexport support added upstream.
+
+The following tools **work with real `.tracy` save files** (via `tracy-csvexport -u`):
+- `get_flame_graph`, `get_top_table`, `get_icicle_graph`, `get_call_graph`, `get_thread_profile`
 
 ---
 
@@ -546,12 +741,65 @@ and contention count (number of times a thread had to wait).
 | `max_avg_time_ms` | number | 5 | Flag GPU zones averaging above this |
 | `max_total_time_ms` | number | 50 | Flag GPU zones with total time above this |
 
+### `get_flame_graph`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `path` | string | required | Path to `.tracy` file |
+| `format` | string | `tree` | Output format: `tree` (indented text) or `folded` (flamegraph.pl compatible) |
+| `min_percent` | number | 1.0 | Hide nodes below this % of total time |
+| `max_depth` | number | 8 | Maximum tree depth to show |
+
+Reconstructs the call tree with inclusive/exclusive time from per-call data.
+Outputs a text tree by default, or folded stacks for `flamegraph.pl` / `speedscope`.
+
+### `get_top_table`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `path` | string | required | Path to `.tracy` file |
+| `limit` | number | 20 | Number of top entries to show |
+
+Hot-functions table sorted by **self (exclusive) time** descending.
+Shows self%, inclusive%, call count, avg self time, source location, and a mini bar chart.
+
+### `get_icicle_graph`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `path` | string | required | Path to `.tracy` file |
+| `width` | number | 100 | Output width in characters |
+| `max_depth` | number | 6 | Maximum depth levels to show |
+| `min_percent` | number | 0.5 | Hide nodes below this % of total |
+
+ASCII icicle graph — grows **top-down** from root to leaves. Width proportional to inclusive time.
+
+### `get_call_graph`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `path` | string | required | Path to `.tracy` file |
+| `format` | string | `text` | `text` for readable list, `dot` for Graphviz DOT |
+
+Directed call graph (caller→callee edges) with edge weights by time transferred.
+Reveals multi-caller hot zones, cyclic dependencies, and unexpected call paths.
+Use `format="dot"` and render with `dot -Tsvg -o callgraph.svg` for visualization.
+
+### `get_thread_profile`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `path` | string | required | Path to `.tracy` file |
+
+Per-thread profiling: CPU utilization per thread, zone breakdown per thread,
+and zones that appear on multiple threads. Diagnose load imbalance and thread starvation.
+
 ---
 
 ## Testing
 
 ```bash
-npm test              # 67 unit + integration tests
+npm test              # 69 unit + integration tests
 npm run test:watch    # watch mode
 npm run test:coverage # coverage report
 ```
