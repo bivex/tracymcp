@@ -17,7 +17,12 @@ import { TracyFrameParser } from "./frames.js";
 import { TracyPlotParser } from "./plots.js";
 import { TracyLockParser } from "./locks.js";
 import { TracyGpuParser } from "./gpu.js";
-import { buildFlameGraph, formatFlameGraph, formatFoldedStacks } from "./flamegraph.js";
+import {
+  buildFlameGraph, formatFlameGraph, formatFoldedStacks,
+  buildTopTable, formatTopTable,
+  formatIcicleGraph,
+  buildCallGraph, formatCallGraphDot, formatCallGraphText,
+} from "./flamegraph.js";
 
 const CSVEXPORT_BINARY = path.join(
   path.dirname(new URL(import.meta.url).pathname),
@@ -229,6 +234,44 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             format: { type: "string", enum: ["tree", "folded"], description: "Output format: 'tree' (default) for indented text, 'folded' for folded-stacks (flamegraph.pl compatible)" },
             min_percent: { type: "number", description: "Hide nodes below this % of total time (default: 1.0)" },
             max_depth: { type: "number", description: "Maximum tree depth to show (default: 8)" },
+          },
+          required: ["path"],
+        },
+      },
+      {
+        name: "get_top_table",
+        description: "Hot-functions table sorted by self (exclusive) time — the fastest way to find which zones are consuming the most CPU on their own. Shows self%, inclusive%, call count, avg self time, and source location.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path:  { type: "string", description: "Path to the .tracy file" },
+            limit: { type: "number", description: "Number of top entries to show (default: 20)" },
+          },
+          required: ["path"],
+        },
+      },
+      {
+        name: "get_icicle_graph",
+        description: "ASCII icicle graph — like a flame graph but growing top-down from root to leaves. Width is proportional to inclusive time. Useful for reading the call stack in natural top→bottom order.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path:        { type: "string", description: "Path to the .tracy file" },
+            width:       { type: "number", description: "Output width in characters (default: 100)" },
+            max_depth:   { type: "number", description: "Maximum depth levels to show (default: 6)" },
+            min_percent: { type: "number", description: "Hide nodes below this % of total (default: 0.5)" },
+          },
+          required: ["path"],
+        },
+      },
+      {
+        name: "get_call_graph",
+        description: "Call graph showing which zones call which other zones, with edge weights by time transferred. Outputs a text adjacency list (default) or Graphviz DOT format for visualization with dot/d3/etc. Reveals cyclic paths and multi-caller hot zones.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path:   { type: "string", description: "Path to the .tracy file" },
+            format: { type: "string", enum: ["text", "dot"], description: "'text' (default) for readable list, 'dot' for Graphviz DOT (render with: dot -Tsvg)" },
           },
           required: ["path"],
         },
@@ -730,27 +773,33 @@ ${percentileLines}`;
       }
     }
 
-    case "get_flame_graph": {
-      const { path, format, min_percent, max_depth } = args as {
+    case "get_flame_graph":
+    case "get_top_table":
+    case "get_icicle_graph":
+    case "get_call_graph": {
+      const {
+        path, format, min_percent, max_depth, width, limit
+      } = args as {
         path: string;
-        format?: "tree" | "folded";
+        format?: string;
         min_percent?: number;
         max_depth?: number;
+        width?: number;
+        limit?: number;
       };
 
       if (!fs.existsSync(path)) {
         return { content: [{ type: "text", text: `Error: File not found: ${path}` }], isError: true };
       }
 
-      try {
-        // Use tracy-csvexport -u (per-call) to get timing data for all zones
-        if (!fs.existsSync(CSVEXPORT_BINARY)) {
-          return {
-            content: [{ type: "text", text: `tracy-csvexport not found at ${CSVEXPORT_BINARY}` }],
-            isError: true,
-          };
-        }
+      if (!fs.existsSync(CSVEXPORT_BINARY)) {
+        return {
+          content: [{ type: "text", text: `tracy-csvexport not found at ${CSVEXPORT_BINARY}` }],
+          isError: true,
+        };
+      }
 
+      try {
         const result = spawnSync(CSVEXPORT_BINARY, ["-u", path], {
           encoding: "utf8",
           maxBuffer: 256 * 1024 * 1024,
@@ -764,17 +813,32 @@ ${percentileLines}`;
         }
 
         const fg = buildFlameGraph(result.stdout);
+        let text: string;
 
-        const text = format === "folded"
-          ? formatFoldedStacks(fg)
-          : formatFlameGraph(fg, {
-              minPercent: min_percent ?? 1.0,
-              maxDepth:   max_depth ?? 8,
-            });
+        if (name === "get_top_table") {
+          text = formatTopTable(buildTopTable(fg), limit ?? 20);
+        } else if (name === "get_icicle_graph") {
+          text = formatIcicleGraph(fg, {
+            width:      width      ?? 100,
+            maxDepth:   max_depth  ?? 6,
+            minPercent: min_percent ?? 0.5,
+          });
+        } else if (name === "get_call_graph") {
+          const cg = buildCallGraph(fg);
+          text = format === "dot" ? formatCallGraphDot(cg) : formatCallGraphText(cg);
+        } else {
+          // get_flame_graph
+          text = format === "folded"
+            ? formatFoldedStacks(fg)
+            : formatFlameGraph(fg, {
+                minPercent: min_percent ?? 1.0,
+                maxDepth:   max_depth  ?? 8,
+              });
+        }
 
         return { content: [{ type: "text", text }] };
       } catch (error) {
-        return { content: [{ type: "text", text: `Error building flame graph: ${error}` }], isError: true };
+        return { content: [{ type: "text", text: `Error: ${error}` }], isError: true };
       }
     }
 
