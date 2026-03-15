@@ -393,6 +393,7 @@ Note: Use find_problematic_zones for timing analysis or get_memory_stats for mem
             ? `[${index + 1}/${matches.length}] `
             : '';
           return `${header}Zone: ${z.name}
+${z.thread ? `Thread: ${z.thread}` : ''}
 ${z.file ? `Location: ${z.file}:${z.line || '?'}` : ''}
 
 Statistics

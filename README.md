@@ -81,25 +81,32 @@ Claude picks the right tool(s), interprets the numbers, and tells you what to fi
 find_problematic_zones(path="/traces/my_trace.tracy")
 ```
 
-You get a ranked list of slow zones with severity, timings, and a suggested fix:
+You get a ranked list of slow zones with severity, timings, and a suggested fix.
+Thread names are shown when available:
 
 ```
 Found 3 problematic zone(s):
 
-🔴 #1: database_query  (main.cpp:86)
+🔴 #1: database_query  [main thread]
+   Location: main.cpp:86
+   Issues:
    • High total time: 66.28 ms
    • High average time: 66.28 ms
-   Stats: 1 call, avg 66.28 ms, min 66.28 ms, max 66.28 ms
+   Stats: 1 call, avg: 66.28ms, min: 66.28ms, max: 66.28ms, total: 66.28ms
    💡 Consider caching results or moving to background thread
 
-🟡 #2: render  (renderer.cpp:210)
-   • P90 outlier: 12.4 ms (avg is 2.1 ms)
-   Stats: 847 calls, avg 2.1 ms, min 0.8 ms, max 18.3 ms
+🟡 #2: render  [render thread]
+   Location: renderer.cpp:210
+   Issues:
+   • High P90: 12.40ms (P50: 1.54ms, P99: 18.35ms)
+   Stats: 847 calls, avg: 2.10ms, min: 0.81ms, max: 18.35ms, total: 1779.37ms
    💡 Investigate occasional spikes — may be GC or lock contention
 
-🟢 #3: physics_update  (physics.cpp:44)
-   • Inconsistent timing (CV: 94%)
-   Stats: 847 calls, avg 1.2 ms, min 0.1 ms, max 9.7 ms
+🟢 #3: physics_update  [worker]
+   Location: physics.cpp:44
+   Issues:
+   • Inconsistent timing (CV: 94.0%)
+   Stats: 847 calls, avg: 1.20ms, min: 0.10ms, max: 9.70ms, total: 1016.40ms
    💡 Check for variable-sized work batches or lock contention
 ```
 
@@ -123,6 +130,7 @@ get_zone_stats(path="/traces/my_trace.tracy", zone="render")
 
 ```
 Zone: render
+Thread: render thread
 Location: renderer.cpp:210
 
 Statistics
@@ -207,7 +215,122 @@ find_memory_leaks(
 
 ---
 
-### Typical debugging session
+### "What did my app log during the trace?"
+
+```
+list_messages(path="/traces/my_trace.tracy")
+list_messages(path="/traces/my_trace.tracy", severity="Warning")
+list_messages(path="/traces/my_trace.tracy", filter="timeout")
+```
+
+```
+5 message(s):
+
+[   0.000ms] ℹ️  INFO     Engine initialised
+[  16.000ms] ℹ️  INFO     Frame 1 complete
+[  32.500ms] ⚠️  WARNING  Frame took 50ms — over budget
+[  82.000ms] ❌ ERROR    Shader compile failed: syntax error at line 42
+[  82.100ms] ℹ️  INFO     Fallback shader loaded
+```
+
+Useful for correlating log events with timing spikes from `find_problematic_zones`.
+
+---
+
+### "Is my frame rate stable?"
+
+```
+get_frame_stats(path="/traces/my_trace.tracy")
+```
+
+```
+Frame Stats
+===========
+
+[Game Frame] 3 frames
+  Avg FPS:      41.7
+  Avg frame:    24.0 ms
+  P50:          16.0 ms
+  P99:          50.0 ms
+  Min:          16.0 ms
+  Max:          50.0 ms
+  Dropped (>16.7ms): 1 / 3 (33.3%)
+```
+
+`Dropped` counts frames that exceeded 60 Hz budget. A high P99 with a low average points to
+occasional hitches rather than a sustained throughput problem.
+
+---
+
+### "What are my custom metrics doing?"
+
+```
+get_plot_stats(path="/traces/my_trace.tracy")
+```
+
+```
+Plot Stats
+==========
+
+FPS
+  Min:      41.7
+  Max:     120.0
+  Avg:      85.3
+  Last:     60.0
+  Duration: 1000.0 ms
+```
+
+Use `TracyPlot("FPS", fps)` in your app to push any numeric metric into the trace.
+Good candidates: draw calls, entity count, cache hit rate, queue depth.
+
+---
+
+### "Where are threads blocking on locks?"
+
+```
+find_lock_contention(path="/traces/my_trace.tracy")
+find_lock_contention(path="/traces/my_trace.tracy", min_wait_ms=5)
+```
+
+```
+Lock Contention Report
+======================
+
+RenderMutex (lock 0x1001)
+  Total wait:   7.0 ms
+  Max single wait: 7.0 ms
+  Contention count: 1
+  💡 Consider lock-free data structures or finer-grained locking
+```
+
+High `contention count` with low `max single wait` suggests frequent but short blocking —
+a candidate for a reader-writer lock or lock-free queue.
+High `max single wait` with low count means rare but severe stalls — look for long critical sections.
+
+---
+
+### "Is the GPU keeping up?"
+
+```
+find_problematic_gpu_zones(path="/traces/my_trace.tracy")
+find_problematic_gpu_zones(path="/traces/my_trace.tracy", max_avg_time_ms=2, max_total_time_ms=16)
+```
+
+```
+Problematic GPU Zones
+=====================
+
+🔴 DrawScene  (context 0)
+   Total: 8.0 ms, Avg: 8.0 ms, Calls: 1
+   💡 Optimize shaders or reduce draw call count
+```
+
+GPU zones are recorded with `TracyGpuZone` / `TracyGpuZoneC`. They show actual GPU time,
+not CPU submission time.
+
+---
+
+### Typical full debugging session
 
 ```
 # 1. Orient — what kind of file is this?
@@ -216,15 +339,27 @@ read_trace(path="/traces/my_trace.tracy")
 # 2. Explore — what zones are instrumented?
 list_zones(path="/traces/my_trace.tracy")
 
-# 3. Find hot spots
+# 3. Find CPU hot spots (with thread names)
 find_problematic_zones(path="/traces/my_trace.tracy", max_total_time_ms=10)
 
 # 4. Drill into the worst offender
 get_zone_stats(path="/traces/my_trace.tracy", zone="database_query")
 
-# 5. Check for memory problems
+# 5. Check frame pacing
+get_frame_stats(path="/traces/my_trace.tracy")
+
+# 6. Check GPU
+find_problematic_gpu_zones(path="/traces/my_trace.tracy")
+
+# 7. Find lock bottlenecks
+find_lock_contention(path="/traces/my_trace.tracy")
+
+# 8. Check memory
 get_memory_stats(path="/traces/my_trace.tracy")
 find_memory_leaks(path="/traces/my_trace.tracy", max_leak_size_mb=0.1)
+
+# 9. Read log messages around the spike
+list_messages(path="/traces/my_trace.tracy", severity="Warning")
 ```
 
 ---
@@ -266,10 +401,14 @@ For real save files the server runs `tracy-csvexport` twice:
 - default mode → aggregated stats (total, avg, min, max, stddev)
 - `-u` mode → one row per call → used to compute P50/P90/P99
 
-Memory tools (`get_memory_stats`, `find_memory_leaks`) only work on synthetic
-event-stream traces because real save files store memory data in a format that
-`tracy-csvexport` does not expose. Instrument and capture a dedicated memory
-trace if you need this on a real app — see the `instrument/` directory.
+The following tools require the synthetic event-stream format (not real `.tracy` save files)
+because `tracy-csvexport` does not expose this data:
+- `get_memory_stats`, `find_memory_leaks`
+- `list_messages`, `get_frame_stats`, `get_plot_stats`
+- `find_lock_contention`, `find_problematic_gpu_zones`
+
+For these tools on a real app, instrument and capture a dedicated trace using the event types
+described in `instrument/` — or file an issue if you need csvexport support added upstream.
 
 ---
 
@@ -289,6 +428,8 @@ Severity levels:
 - 🟡 **medium** — average time exceeds threshold, or P90 >> average
 - 🟢 **low** — high coefficient of variation (inconsistent timing)
 
+Thread names are shown in brackets when present in the trace.
+
 ### `get_zone_stats`
 
 | Parameter | Type | Default | Description |
@@ -296,8 +437,9 @@ Severity levels:
 | `path` | string | required | Path to `.tracy` file |
 | `zone` | string | required | Zone name (exact match) |
 
-Returns all zones with that name. If a name appears at multiple source locations
-(e.g. `render` defined in five translation units), each is shown separately.
+Returns all zones with that name, including thread name and source location.
+If a name appears at multiple source locations (e.g. `render` defined in five translation units),
+each is shown separately with a `[1/5]` prefix.
 
 ### `list_zones`
 
@@ -320,8 +462,7 @@ Returns file type, compression, stream count, sizes.
 |-----------|------|---------|-------------|
 | `path` | string | required | Path to `.tracy` file |
 
-Returns total allocated/freed, current and peak usage, allocation/free counts,
-and leak count.
+Returns total allocated/freed, current and peak usage, allocation/free counts, and leak count.
 
 ### `find_memory_leaks`
 
@@ -333,6 +474,49 @@ and leak count.
 
 Reports leaks with address and name (if instrumented with `TracyMemPro`),
 usage spikes, and fragmentation patterns.
+
+### `list_messages`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `path` | string | required | Path to `.tracy` file |
+| `filter` | string | — | Case-insensitive substring filter on message text |
+| `severity` | string | `Trace` | Minimum severity: `Trace` `Debug` `Info` `Warning` `Error` `Fatal` |
+
+### `get_frame_stats`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `path` | string | required | Path to `.tracy` file |
+
+Returns per-group: frame count, avg FPS, min/max/avg/P50/P99 frame time, dropped frame count
+(frames exceeding 16.667 ms / 60 Hz budget).
+
+### `get_plot_stats`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `path` | string | required | Path to `.tracy` file |
+
+Returns per-plot: min, max, avg, last value, duration of the recording.
+
+### `find_lock_contention`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `path` | string | required | Path to `.tracy` file |
+| `min_wait_ms` | number | 0.1 | Only show locks with total wait above this |
+
+Reports lock name (if set with `TracyLockN`), total wait time, worst single wait,
+and contention count (number of times a thread had to wait).
+
+### `find_problematic_gpu_zones`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `path` | string | required | Path to `.tracy` file |
+| `max_avg_time_ms` | number | 5 | Flag GPU zones averaging above this |
+| `max_total_time_ms` | number | 50 | Flag GPU zones with total time above this |
 
 ---
 

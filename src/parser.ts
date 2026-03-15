@@ -36,6 +36,7 @@ const enum QueueType {
   SingleStringData = 99,
   SecondStringData = 100,
   StringData = 104,
+  ThreadName = 105,
 }
 
 // Source location structure (from QueueSourceLocation)
@@ -66,6 +67,7 @@ export interface ZoneTiming {
   file?: string;
   function?: string;
   line?: number;
+  thread?: string;  // thread name (if ThreadName events are present)
   count: number;
   totalTime: number;      // nanoseconds
   minTime: number;
@@ -93,6 +95,8 @@ export class TracyTraceParser {
   private sourceLocations: Map<bigint, SourceLocation> = new Map();
   private zoneTimings: Map<string, ZoneTiming> = new Map();
   private activeZones: Map<number, ActiveZone[]> = new Map(); // thread -> zones
+  private threadNames: Map<number, string> = new Map();       // threadId -> name
+  private currentThread: number = 0;
   private lastSrcLoc: bigint = 0n;
 
   // Parse a trace file and extract zone timings
@@ -383,6 +387,9 @@ export class TracyTraceParser {
           case QueueType.SecondStringData:
             offset = this.handleStringData(data, offset, eventType);
             break;
+          case QueueType.ThreadName:
+            offset = this.handleThreadName(data, offset);
+            break;
           case QueueType.ZoneText:
             offset = this.handleZoneText(data, offset);
             break;
@@ -398,6 +405,10 @@ export class TracyTraceParser {
             offset = this.skipBytes(data, offset, 8 + 8);
             break;
           case QueueType.ThreadContext:
+            // QueueThreadContext: thread(4) — sets the current thread for subsequent events
+            if (offset + 4 <= data.length) {
+              this.currentThread = data.readUInt32LE(offset);
+            }
             offset = this.skipBytes(data, offset, 4);
             break;
           default:
@@ -421,8 +432,7 @@ export class TracyTraceParser {
     const time = this.readInt64(data, offset);
     const srcloc = this.readUInt64(data, offset + 8);
 
-    // Synthetic test traces are single-threaded, so threadId=0 is correct
-    const threadId = 0;
+    const threadId = this.currentThread;
 
     if (!this.activeZones.has(threadId)) {
       this.activeZones.set(threadId, []);
@@ -443,7 +453,7 @@ export class TracyTraceParser {
     if (offset + 8 > data.length) return offset;
 
     const endTime = this.readInt64(data, offset);
-    const threadId = 0;
+    const threadId = this.currentThread;
 
     const zones = this.activeZones.get(threadId);
     if (!zones || zones.length === 0) {
@@ -472,6 +482,7 @@ export class TracyTraceParser {
         file: srcLoc ? this.strings.get(srcLoc.file) : undefined,
         function: srcLoc ? this.strings.get(srcLoc.function) : undefined,
         line: srcLoc?.line,
+        thread: this.threadNames.get(threadId),
         count: 0,
         totalTime: 0,
         minTime: duration,
@@ -544,6 +555,24 @@ export class TracyTraceParser {
     return strEnd + 1;
   }
 
+  // Handle ThreadName event: QueueStringTransfer — ptr(8) is the thread ID, then name string + NUL
+  private handleThreadName(data: Buffer, offset: number): number {
+    if (offset + 8 > data.length) return offset;
+
+    // ptr field holds the thread ID (uint64, but fits in uint32 for most platforms)
+    const threadId = data.readUInt32LE(offset); // lower 32 bits match ThreadContext thread IDs
+
+    let strEnd = offset + 8;
+    while (strEnd < data.length && data[strEnd] !== 0) strEnd++;
+
+    if (strEnd < data.length) {
+      const name = data.subarray(offset + 8, strEnd).toString('utf-8');
+      this.threadNames.set(threadId, name);
+    }
+
+    return strEnd + 1;
+  }
+
   // Handle ZoneText / ZoneName event: QueueZoneTextFat: uint64_t ptr, uint16_t size, char[] text
   // Applies a custom display name to the innermost active zone.
   private handleZoneText(data: Buffer, offset: number): number {
@@ -554,7 +583,7 @@ export class TracyTraceParser {
 
     const text = data.subarray(offset + 10, offset + 10 + size).toString('utf-8');
 
-    const zones = this.activeZones.get(0);
+    const zones = this.activeZones.get(this.currentThread);
     if (zones && zones.length > 0) {
       zones[zones.length - 1].customName = text;
     }

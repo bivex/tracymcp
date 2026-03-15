@@ -152,7 +152,8 @@ export class TracyAnalyzer {
       const pz = zones[i];
       const icon = pz.severity === 'high' ? '🔴' : pz.severity === 'medium' ? '🟡' : '🟢';
 
-      output += `${icon} #${i + 1}: ${pz.zone.name}\n`;
+      const threadSuffix = pz.zone.thread ? `  [${pz.zone.thread}]` : '';
+      output += `${icon} #${i + 1}: ${pz.zone.name}${threadSuffix}\n`;
 
       if (pz.zone.function) {
         output += `   Function: ${pz.zone.function}`;
