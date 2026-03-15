@@ -322,7 +322,7 @@ export function formatTopTable(entries: TopEntry[], limit = 20): string {
 
   const ms = (n: number) => (n / 1_000_000).toFixed(3);
   const pct = (n: number) => n.toFixed(1).padStart(5) + '%';
-  const bar = (pct: number, w = 20) => '█'.repeat(Math.round(pct / 100 * w)).padEnd(w);
+  const bar = (pct: number, w = 20) => '█'.repeat(Math.max(0, Math.round(pct / 100 * w))).padEnd(w);
 
   const header =
     `${'#'.padStart(3)}  ${'Self%'.padStart(6)}  ${'Self ms'.padStart(8)}  ${'Incl%'.padStart(6)}  ${'Incl ms'.padStart(8)}  ${'×Calls'.padStart(6)}  ${'Avg self'.padStart(9)}  Name`;
@@ -619,4 +619,169 @@ export function formatFoldedStacks(fg: FlameGraph): string {
   }
 
   return lines.join('\n');
+}
+
+// ── Thread Profiling ──────────────────────────────────────────────────────────
+
+export interface ThreadZoneStat {
+  name: string;
+  file?: string;
+  line?: number;
+  selfNs: number;
+  inclusiveNs: number;
+  count: number;
+}
+
+export interface ThreadProfile {
+  threadId: string;
+  activeNs: number;
+  traceSpanNs: number;
+  utilizationPct: number;
+  zones: ThreadZoneStat[];
+  startNs: number;
+  endNs: number;
+}
+
+export interface ThreadProfileResult {
+  threads: ThreadProfile[];
+  traceSpanNs: number;
+  sharedZones: Array<{ name: string; threads: string[]; totalNs: number }>;
+}
+
+export function buildThreadProfile(unwrapCsv: string): ThreadProfileResult {
+  interface RawCall { name: string; file?: string; line?: number; startNs: number; endNs: number; thread: string; }
+  const calls: RawCall[] = [];
+  const csvLines = unwrapCsv.split('\n');
+  for (let i = 1; i < csvLines.length; i++) {
+    const p = csvLines[i].split(',');
+    if (p.length < 6) continue;
+    const startNs = parseInt(p[3], 10), execNs = parseInt(p[4], 10);
+    if (isNaN(startNs) || isNaN(execNs) || execNs <= 0) continue;
+    calls.push({ name: p[0], file: p[1] || undefined, line: p[2] ? parseInt(p[2], 10) : undefined,
+                 startNs, endNs: startNs + execNs, thread: p[5] || '0' });
+  }
+  if (calls.length === 0) return { threads: [], traceSpanNs: 0, sharedZones: [] };
+
+  const globalMaxNs  = Math.max(...calls.map(c => c.endNs));
+  const globalMinNs  = Math.min(...calls.map(c => c.startNs));
+  const traceSpanNs  = globalMaxNs - globalMinNs;
+
+  const byThread = new Map<string, RawCall[]>();
+  for (const c of calls) {
+    if (!byThread.has(c.thread)) byThread.set(c.thread, []);
+    byThread.get(c.thread)!.push(c);
+  }
+
+  const profiles: ThreadProfile[] = [];
+
+  for (const [threadId, tCalls] of byThread) {
+    tCalls.sort((a, b) => a.startNs - b.startNs);
+    const threadMin = tCalls[0].startNs;
+    const threadMax = Math.max(...tCalls.map(c => c.endNs));
+
+    interface Frame { name: string; file?: string; line?: number; startNs: number; endNs: number; childNs: number; }
+    const stack: Frame[] = [];
+    const zoneMap = new Map<string, ThreadZoneStat>();
+    let topLevelActiveNs = 0;
+
+    function finishFrame(f: Frame, depth: number): void {
+      const incl   = f.endNs - f.startNs;
+      const selfNs = Math.max(0, incl - f.childNs);  // clamp: child time may exceed parent due to overlap
+      if (!zoneMap.has(f.name))
+        zoneMap.set(f.name, { name: f.name, file: f.file, line: f.line, selfNs: 0, inclusiveNs: 0, count: 0 });
+      const z = zoneMap.get(f.name)!;
+      z.selfNs += selfNs; z.inclusiveNs += incl; z.count++;
+      if (depth === 0) topLevelActiveNs += incl;
+    }
+
+    for (const call of tCalls) {
+      while (stack.length > 0 && stack[stack.length - 1].endNs <= call.startNs) {
+        const f = stack.pop()!;
+        finishFrame(f, stack.length);
+        if (stack.length > 0) stack[stack.length - 1].childNs += f.endNs - f.startNs;
+      }
+      stack.push({ name: call.name, file: call.file, line: call.line, startNs: call.startNs, endNs: call.endNs, childNs: 0 });
+    }
+    while (stack.length > 0) {
+      const f = stack.pop()!;
+      finishFrame(f, stack.length);
+      if (stack.length > 0) stack[stack.length - 1].childNs += f.endNs - f.startNs;
+    }
+
+    profiles.push({
+      threadId, activeNs: topLevelActiveNs, traceSpanNs,
+      utilizationPct: traceSpanNs > 0 ? topLevelActiveNs / traceSpanNs * 100 : 0,
+      zones: [...zoneMap.values()].sort((a, b) => b.selfNs - a.selfNs),
+      startNs: threadMin, endNs: threadMax,
+    });
+  }
+
+  profiles.sort((a, b) => b.activeNs - a.activeNs);
+
+  const zoneThreads = new Map<string, Set<string>>();
+  const zoneTotals  = new Map<string, number>();
+  for (const tp of profiles) {
+    for (const z of tp.zones) {
+      if (!zoneThreads.has(z.name)) zoneThreads.set(z.name, new Set());
+      zoneThreads.get(z.name)!.add(tp.threadId);
+      zoneTotals.set(z.name, (zoneTotals.get(z.name) ?? 0) + z.inclusiveNs);
+    }
+  }
+  const sharedZones = [...zoneThreads.entries()]
+    .filter(([, t]) => t.size > 1)
+    .map(([name, t]) => ({ name, threads: [...t], totalNs: zoneTotals.get(name) ?? 0 }))
+    .sort((a, b) => b.totalNs - a.totalNs);
+
+  return { threads: profiles, traceSpanNs, sharedZones };
+}
+
+export function formatThreadProfile(result: ThreadProfileResult): string {
+  const { threads, traceSpanNs, sharedZones } = result;
+  if (threads.length === 0) return 'No thread data found.';
+
+  const msf  = (n: number) => (n / 1_000_000).toFixed(2);
+  const bar  = (p: number, w = 30) => '█'.repeat(Math.max(0, Math.round(p / 100 * w))).padEnd(w);
+  const pct  = (n: number) => n.toFixed(1).padStart(5) + '%';
+  const out: string[] = [];
+
+  out.push(`Thread Profile  (trace span: ${msf(traceSpanNs)}ms, ${threads.length} thread(s))\n`);
+
+  out.push('Summary');
+  out.push(`  ${'Thread'.padEnd(12)} ${'Active ms'.padStart(10)} ${'Util%'.padStart(6)}  ${'CPU utilization'.padEnd(32)} ${'#Zones'.padStart(6)}`);
+  out.push('  ' + '─'.repeat(72));
+  for (const tp of threads) {
+    out.push(
+      `  ${('Thread-' + tp.threadId).padEnd(12)} ${msf(tp.activeNs).padStart(10)} ${pct(tp.utilizationPct)}  ` +
+      `${bar(tp.utilizationPct, 32)} ${String(tp.zones.length).padStart(6)}`
+    );
+  }
+
+  for (const tp of threads) {
+    out.push(`\n── Thread-${tp.threadId}  (active ${msf(tp.activeNs)}ms  util ${pct(tp.utilizationPct)}) ──`);
+    out.push(`   ${'Name'.padEnd(28)} ${'Self%'.padStart(6)} ${'Self ms'.padStart(8)} ${'Incl ms'.padStart(8)} ${'×'.padStart(5)}  bar`);
+    out.push('   ' + '─'.repeat(72));
+    for (const z of tp.zones.slice(0, 15)) {
+      // Percentage relative to global trace span — meaningful for cross-thread comparison
+      const sp = traceSpanNs > 0 ? z.selfNs / traceSpanNs * 100 : 0;
+      const ip = traceSpanNs > 0 ? z.inclusiveNs / traceSpanNs * 100 : 0;
+      const loc = z.file ? `  ${z.file}:${z.line ?? '?'}` : '';
+      out.push(
+        `   ${z.name.padEnd(28)} ${pct(sp)} ${msf(z.selfNs).padStart(8)} ${msf(z.inclusiveNs).padStart(8)} ` +
+        `${String(z.count).padStart(5)}  ${bar(sp, 12)}${loc}`
+      );
+    }
+  }
+
+  if (sharedZones.length > 0) {
+    out.push('\n── Zones running on multiple threads ──');
+    out.push(`   ${'Zone'.padEnd(28)} ${'Threads'.padEnd(20)} ${'Total ms'.padStart(10)}`);
+    out.push('   ' + '─'.repeat(62));
+    for (const z of sharedZones) {
+      out.push(`   ${z.name.padEnd(28)} ${z.threads.map(t => 'T-' + t).join(', ').padEnd(20)} ${msf(z.totalNs).padStart(10)}`);
+    }
+  } else {
+    out.push('\nNo zones shared across threads — clean thread separation.');
+  }
+
+  return out.join('\n');
 }

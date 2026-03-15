@@ -22,6 +22,7 @@ import {
   buildTopTable, formatTopTable,
   formatIcicleGraph,
   buildCallGraph, formatCallGraphDot, formatCallGraphText,
+  buildThreadProfile, formatThreadProfile,
 } from "./flamegraph.js";
 
 const CSVEXPORT_BINARY = path.join(
@@ -272,6 +273,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             path:   { type: "string", description: "Path to the .tracy file" },
             format: { type: "string", enum: ["text", "dot"], description: "'text' (default) for readable list, 'dot' for Graphviz DOT (render with: dot -Tsvg)" },
+          },
+          required: ["path"],
+        },
+      },
+      {
+        name: "get_thread_profile",
+        description: "Per-thread profiling: CPU utilization per thread, self/inclusive time breakdown by zone on each thread, and zones that appear on multiple threads. Essential for diagnosing load imbalance, thread starvation, and cross-thread contention.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Path to the .tracy file" },
           },
           required: ["path"],
         },
@@ -776,7 +788,8 @@ ${percentileLines}`;
     case "get_flame_graph":
     case "get_top_table":
     case "get_icicle_graph":
-    case "get_call_graph": {
+    case "get_call_graph":
+    case "get_thread_profile": {
       const {
         path, format, min_percent, max_depth, width, limit
       } = args as {
@@ -812,28 +825,33 @@ ${percentileLines}`;
           };
         }
 
-        const fg = buildFlameGraph(result.stdout);
         let text: string;
 
-        if (name === "get_top_table") {
-          text = formatTopTable(buildTopTable(fg), limit ?? 20);
-        } else if (name === "get_icicle_graph") {
-          text = formatIcicleGraph(fg, {
-            width:      width      ?? 100,
-            maxDepth:   max_depth  ?? 6,
-            minPercent: min_percent ?? 0.5,
-          });
-        } else if (name === "get_call_graph") {
-          const cg = buildCallGraph(fg);
-          text = format === "dot" ? formatCallGraphDot(cg) : formatCallGraphText(cg);
+        if (name === "get_thread_profile") {
+          // thread profile works directly on raw CSV — no flame tree needed
+          text = formatThreadProfile(buildThreadProfile(result.stdout));
         } else {
-          // get_flame_graph
-          text = format === "folded"
-            ? formatFoldedStacks(fg)
-            : formatFlameGraph(fg, {
-                minPercent: min_percent ?? 1.0,
-                maxDepth:   max_depth  ?? 8,
-              });
+          const fg = buildFlameGraph(result.stdout);
+          if (name === "get_top_table") {
+            text = formatTopTable(buildTopTable(fg), limit ?? 20);
+          } else if (name === "get_icicle_graph") {
+            text = formatIcicleGraph(fg, {
+              width:      width      ?? 100,
+              maxDepth:   max_depth  ?? 6,
+              minPercent: min_percent ?? 0.5,
+            });
+          } else if (name === "get_call_graph") {
+            const cg = buildCallGraph(fg);
+            text = format === "dot" ? formatCallGraphDot(cg) : formatCallGraphText(cg);
+          } else {
+            // get_flame_graph
+            text = format === "folded"
+              ? formatFoldedStacks(fg)
+              : formatFlameGraph(fg, {
+                  minPercent: min_percent ?? 1.0,
+                  maxDepth:   max_depth  ?? 8,
+                });
+          }
         }
 
         return { content: [{ type: "text", text }] };
